@@ -1,75 +1,328 @@
-# Agent Task Broker
+# Agent Broker
 
-A coordination layer for AI agents.
+MCP/JSON-RPC broker for delegating tasks between AI agent roles.
+
+The current API is based on a small task lifecycle:
+
+1. `create_task`
+2. `await_task`
+3. `listen_role`
+4. `list_tasks`
+5. `get_task`
+6. `solve_task`
+
+## Repository Layout
+
+```text
+.
+├── agent-broker/               # Go server
+├── data/                       # Runtime data directory
+├── docs/dev/                   # Version plans and design notes
+├── examples/ralph-simple/      # Example role prompts
+├── Makefile
+└── README.md
+```
 
 ## Core Concepts
 
-- **Tenancy**: Use the `X-Project-Id` HTTP header to isolate tasks between different projects.
-- **Roles**: Tasks are assigned to roles (e.g., `coder`, `researcher`).
-- **Lifecycle**: Create a task, optionally await its completion, and workers solve it.
+1. Tenancy: use `X-Project-Id` to isolate tasks between projects
+2. Roles: tasks are assigned to roles such as `coder`
+3. Lifecycle: create a task, optionally wait for it, let a worker pick it up, then solve it
 
-## MCP Tools
+## Run
 
-The broker implements the Model Context Protocol (MCP).
+Build from the repository root:
+
+```bash
+make build
+```
+
+Run with defaults:
+
+```bash
+make run
+```
+
+Direct Go run is also fine:
+
+```bash
+cd agent-broker
+go run .
+```
+
+Default server settings:
+
+1. port: `9197`
+2. data dir: `data`
+3. sync enabled: `true`
+4. async enabled: `true`
+
+MCP endpoint:
+
+```text
+http://localhost:9197/rpc
+```
+
+Health endpoint:
+
+```text
+http://localhost:9197/health
+```
+
+## Environment
+
+Supported environment variables:
+
+1. `PORT`: server port, default `9197`
+2. `DATA_DIR`: persistence root, default `data`
+3. `ENABLE_SYNC`: enables `await_task` and `listen_role(mode="wait")`, default `true`
+4. `ENABLE_ASYNC`: enables `listen_role(mode="poll")`, default `true`
+
+At least one of `ENABLE_SYNC` or `ENABLE_ASYNC` must stay enabled.
+
+## Tool Summary
 
 ### `create_task`
+
 Creates a task and returns immediately.
-- **Arguments**:
-  - `role` (string): Target agent role.
-  - `title` (string): Short task title (max 200 chars).
-  - `task_md` (string): Detailed task description.
-- **Returns**: `task_id`, `status`.
+
+Arguments:
+
+```json
+{
+  "role": "coder",
+  "title": "fix failing tests",
+  "task_md": "..."
+}
+```
+
+Response:
+
+```json
+{
+  "task_id": "...",
+  "status": "queued"
+}
+```
 
 ### `await_task`
-Blocks until the task is solved or timeout.
-- **Arguments**:
-  - `task_id` (string): ID of the task to wait for.
-  - `timeout_ms` (integer, optional): Maximum time to wait.
-- **Returns**: `task_id`, `status`, `result_md` (if solved).
+
+Blocks until the task reaches a terminal state or timeout.
+
+Arguments:
+
+```json
+{
+  "task_id": "...",
+  "timeout_ms": 30000
+}
+```
+
+Solved response:
+
+```json
+{
+  "task_id": "...",
+  "status": "solved",
+  "result_md": "..."
+}
+```
+
+Timeout or still-running response example:
+
+```json
+{
+  "task_id": "...",
+  "status": "queued"
+}
+```
 
 ### `listen_role`
-Worker-facing tool to fetch work.
-- **Arguments**:
-  - `role` (string): Role to listen for.
-  - `mode` (string): `wait` (blocking) or `poll` (immediate).
-  - `timeout_ms` (integer, optional): For `wait` mode.
-- **Returns**: `task` object or `status` (empty/timeout).
+
+Worker-facing tool for both blocking wait and non-blocking polling.
+
+Arguments:
+
+```json
+{
+  "role": "coder",
+  "mode": "wait",
+  "timeout_ms": 30000
+}
+```
+
+Modes:
+
+1. `wait`: block until a task arrives or timeout
+2. `poll`: return immediately if no task is available
+
+Task response:
+
+```json
+{
+  "task": {
+    "task_id": "...",
+    "title": "...",
+    "task_md": "..."
+  }
+}
+```
+
+Empty poll response:
+
+```json
+{
+  "task": null,
+  "status": "empty"
+}
+```
+
+Timed out wait response:
+
+```json
+{
+  "task": null,
+  "status": "timeout"
+}
+```
 
 ### `list_tasks`
-Overview of tasks in the current project.
-- **Arguments**:
-  - `role` (string, optional): Filter by role.
-  - `status` (string, optional): Filter by status.
-- **Returns**: List of task metadata.
+
+Returns lightweight metadata only.
+
+Allowed filters:
+
+1. `role`
+2. `status`
+
+Example:
+
+```json
+{
+  "role": "coder",
+  "status": "queued"
+}
+```
+
+Response shape:
+
+```json
+{
+  "tasks": [
+    {
+      "task_id": "...",
+      "project_id": "default",
+      "role": "coder",
+      "title": "fix failing tests",
+      "status": "queued",
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  ]
+}
+```
 
 ### `get_task`
-Detailed content for one task.
-- **Arguments**:
-  - `task_id` (string): ID of the task.
-  - `include_task_md` (boolean, optional).
-  - `include_result_md` (boolean, optional).
-- **Returns**: Task details (defaults to result if solved, prompt otherwise).
+
+Returns details for one task, but defaults to a context-efficient payload.
+
+Arguments:
+
+```json
+{
+  "task_id": "..."
+}
+```
+
+Default behavior:
+
+1. solved task: returns `result_md`
+2. unfinished task: returns `task_md`
+
+Optional full payload:
+
+```json
+{
+  "task_id": "...",
+  "include_task_md": true,
+  "include_result_md": true
+}
+```
 
 ### `solve_task`
-Submit the result for a task.
-- **Arguments**:
-  - `task_id` (string): Task to resolve.
-  - `result_md` (string): Final output.
 
-## Server Configuration
+Finalizes a task.
 
-Control available features via environment variables:
+Arguments:
 
-- `PORT`: Server port (default: `9197`).
-- `DATA_DIR`: Root directory for task persistence (default: `data`).
-- `ENABLE_SYNC`: Enable blocking tools (`await_task`, `listen_role` with `wait`). Default: `true`.
-- `ENABLE_ASYNC`: Enable polling tools (`listen_role` with `poll`). Default: `true`.
+```json
+{
+  "task_id": "...",
+  "result_md": "..."
+}
+```
 
-Note: At least one mode must be enabled.
+## Typical Flows
+
+### Sync Orchestrator Flow
+
+1. call `create_task`
+2. keep the returned `task_id`
+3. call `await_task`
+4. review the returned result
+
+### Async Orchestrator Flow
+
+1. call `create_task`
+2. keep the returned `task_id`
+3. later call `get_task`
+4. optionally use `list_tasks` for discovery
+
+### Worker Flow
+
+1. call `listen_role(mode="wait")` for blocking worker behavior
+2. or call `listen_role(mode="poll")` for polling worker behavior
+3. do the work
+4. call `solve_task`
+
+## Tenancy
+
+Use the `X-Project-Id` header on requests.
+
+Rules:
+
+1. missing or blank header becomes `default`
+2. invalid path-like values are rejected
+3. tasks, listeners, and persisted state are isolated per project
+
+## Example Prompts
+
+See `examples/ralph-simple/` for example prompts for:
+
+1. `main` sync
+2. `main` async
+3. `coder` sync
+4. `coder` async
 
 ## Development
 
+Build:
+
 ```bash
+make build
+```
+
+Test:
+
+```bash
+cd agent-broker
+go test -count=1 ./...
+```
+
+Extra checks:
+
+```bash
+cd agent-broker
 go build ./...
-go test ./...
+go vet ./...
 ```

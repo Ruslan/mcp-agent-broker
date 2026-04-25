@@ -4,7 +4,7 @@
 BINARY_NAME=broker
 SOURCE_DIR=agent-broker
 PORT=9197
-DATA_DIR=task-data
+DATA_DIR=data
 
 build:
 	@echo "Building $(BINARY_NAME)..."
