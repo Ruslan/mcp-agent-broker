@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,7 +26,7 @@ func TestProjectTenancy_Isolation(t *testing.T) {
 		req := Request{
 			JSONRPC: "2.0",
 			Method:  "tools/call",
-			Params:  json.RawMessage(`{"name":"listen_role_sync","arguments":{"role":"coder"}}`),
+			Params:  json.RawMessage(`{"name":"listen_role","arguments":{"role":"coder","mode":"wait","timeout_ms":2000}}`),
 			ID:      json.RawMessage(`"a1"`),
 		}
 		taskChA <- callHandler(handler, req, projA)
@@ -39,7 +38,7 @@ func TestProjectTenancy_Isolation(t *testing.T) {
 		req := Request{
 			JSONRPC: "2.0",
 			Method:  "tools/call",
-			Params:  json.RawMessage(`{"name":"listen_role_sync","arguments":{"role":"coder"}}`),
+			Params:  json.RawMessage(`{"name":"listen_role","arguments":{"role":"coder","mode":"wait","timeout_ms":2000}}`),
 			ID:      json.RawMessage(`"b1"`),
 		}
 		taskChB <- callHandler(handler, req, projB)
@@ -51,7 +50,7 @@ func TestProjectTenancy_Isolation(t *testing.T) {
 	createReqA := Request{
 		JSONRPC: "2.0",
 		Method:  "tools/call",
-		Params:  json.RawMessage(`{"name":"create_task_async","arguments":{"role":"coder","title":"Task A","task_md":"Content A"}}`),
+		Params:  json.RawMessage(`{"name":"create_task","arguments":{"role":"coder","title":"Task A","task_md":"Content A"}}`),
 		ID:      json.RawMessage(`"a2"`),
 	}
 	resCreateA := callHandler(handler, createReqA, projA)
@@ -71,11 +70,15 @@ func TestProjectTenancy_Isolation(t *testing.T) {
 		data, _ := json.Marshal(res.Result)
 		json.Unmarshal(data, &taskResp)
 		
-		var task map[string]string
-		json.Unmarshal([]byte(taskResp.Content[0].Text), &task)
+		var payload struct {
+			Task struct {
+				Title string `json:"title"`
+			} `json:"task"`
+		}
+		json.Unmarshal([]byte(taskResp.Content[0].Text), &payload)
 		
-		if task["title"] != "Task A" {
-			t.Errorf("Project A listener got wrong task: %v", task)
+		if payload.Task.Title != "Task A" {
+			t.Errorf("Project A listener got wrong task: %v", payload.Task.Title)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Error("Project A listener timed out")
@@ -93,7 +96,7 @@ func TestProjectTenancy_Isolation(t *testing.T) {
 	createReqB := Request{
 		JSONRPC: "2.0",
 		Method:  "tools/call",
-		Params:  json.RawMessage(`{"name":"create_task_async","arguments":{"role":"coder","title":"Task B","task_md":"Content B"}}`),
+		Params:  json.RawMessage(`{"name":"create_task","arguments":{"role":"coder","title":"Task B","task_md":"Content B"}}`),
 		ID:      json.RawMessage(`"b2"`),
 	}
 	callHandler(handler, createReqB, projB)
@@ -110,11 +113,15 @@ func TestProjectTenancy_Isolation(t *testing.T) {
 		data, _ := json.Marshal(res.Result)
 		json.Unmarshal(data, &taskResp)
 		
-		var task map[string]string
-		json.Unmarshal([]byte(taskResp.Content[0].Text), &task)
+		var payload struct {
+			Task struct {
+				Title string `json:"title"`
+			} `json:"task"`
+		}
+		json.Unmarshal([]byte(taskResp.Content[0].Text), &payload)
 
-		if task["title"] != "Task B" {
-			t.Errorf("Project B listener got wrong task: %v", task)
+		if payload.Task.Title != "Task B" {
+			t.Errorf("Project B listener got wrong task: %v", payload.Task.Title)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Error("Project B listener timed out")
@@ -131,8 +138,8 @@ func TestProjectTenancy_InvalidProjectID(t *testing.T) {
 	req := Request{
 		JSONRPC: "2.0",
 		Method:  "tools/call",
-		Params:  json.RawMessage(`{"name":"listen_role_sync","arguments":{"role":"coder"}}`),
-		ID:      json.RawMessage("1"),
+		Params:  json.RawMessage(`{"name":"listen_role","arguments":{"role":"coder","mode":"poll"}}`),
+		ID:      json.RawMessage(`"1"`),
 	}
 	
 	// Invalid project ID (contains separator)
@@ -159,7 +166,7 @@ func TestProjectTenancy_InvalidProjectID(t *testing.T) {
 	defer cancel()
 	
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest("POST", "/rpc", strings.NewReader(`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"listen_role_async","arguments":{"role":"coder"}},"id":"2"}`))
+	r := httptest.NewRequest("POST", "/rpc", strings.NewReader(`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"listen_role","arguments":{"role":"coder","mode":"poll"}},"id":"2"}`))
 	r.Header.Set("X-Project-Id", "   ")
 	r = r.WithContext(ctx)
 	handler.ServeHTTP(w, r)
@@ -178,11 +185,26 @@ func TestProjectTenancy_DiskLayout(t *testing.T) {
 	broker, _ := NewBroker(tmpDir, true, true)
 	
 	proj := "my-project"
-	taskID, _ := broker.CreateTaskAsync(proj, "coder", "Title", "MD")
+	taskID, _ := broker.CreateTask(proj, "coder", "Title", "MD")
 
 	// Check if directory exists
-	path := filepath.Join(tmpDir, proj, taskID, "task.md")
+	// Internal check: can't use taskDir helper as it's private, but we know the layout
+	path := tmpDir + "/" + proj + "/" + taskID + "/task.md"
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		t.Errorf("Task file not found at expected path: %s", path)
 	}
+}
+
+func callHandler(h *JSONRPCHandler, req Request, projectID string) Response {
+	body, _ := json.Marshal(req)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/rpc", strings.NewReader(string(body)))
+	if projectID != "" {
+		r.Header.Set("X-Project-Id", projectID)
+	}
+	h.ServeHTTP(w, r)
+
+	var res Response
+	json.Unmarshal(w.Body.Bytes(), &res)
+	return res
 }

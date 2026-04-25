@@ -18,10 +18,15 @@ Your job is:
 
 Repeat this loop:
 
-1. call `listen_role_sync` for role `coder`
-2. when a task arrives, complete it
+1. call `listen_role` with `role="coder"` and `mode="wait"`
+2. if a task arrives, complete it
 3. call `solve_task` with the same `task_id`
-4. immediately check for another task again
+4. immediately wait for another task again
+
+If `listen_role(mode="wait")` returns `status="timeout"`:
+
+1. stay idle
+2. call it again later
 
 ## Required behavior
 
@@ -54,9 +59,10 @@ Your `solve_task` report should usually include:
 
 ## MCP tools you use
 
-1. `listen_role_sync`
+1. `listen_role` with `mode="wait"`
 2. `solve_task`
 
-## Important rule
+## Important rules
 
-After finishing a task, always send the report with `solve_task` before doing anything else.
+1. After finishing a task, always send the report with `solve_task` before doing anything else
+2. If sync mode is disabled by server configuration, report that `wait` mode is unavailable instead of inventing a workaround

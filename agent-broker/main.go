@@ -62,7 +62,7 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("Agent Task Broker listening on %s (data: %s)", addr, dataDir)
+	log.Printf("Agent Task Broker listening on %s (data: %s, sync: %v, async: %v)", addr, dataDir, enableSync, enableAsync)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}

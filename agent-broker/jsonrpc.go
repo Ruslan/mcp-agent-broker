@@ -138,97 +138,99 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	case "tools/list":
 		var tools []any
-		if h.broker.EnableSync {
-			tools = append(tools,
-				map[string]any{
-					"name":        "create_task_sync",
-					"description": "Send one sync task to a live worker and wait for the final result in this call. The sender should report that the task was sent and then wait for the returned result.",
-					"inputSchema": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"role":    map[string]any{"type": "string"},
-							"title":   map[string]any{"type": "string", "description": "Short task title (max 200 chars)"},
-							"task_md": map[string]any{"type": "string"},
-						},
-						"required": []string{"role", "title", "task_md"},
-					},
-				},
-				map[string]any{
-					"name":        "listen_role_sync",
-					"description": "Wait until one sync task arrives for this role. If a task is received, the worker should complete it, call solve_task with the same task_id, and then check for more tasks again.",
-					"inputSchema": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"role": map[string]any{"type": "string"},
-						},
-						"required": []string{"role"},
-					},
-				},
-			)
-		}
-		if h.broker.EnableAsync {
-			tools = append(tools,
-				map[string]any{
-					"name":        "create_task_async",
-					"description": "Enqueue one async task and return immediately with a generated task_id. After sending, the sender should tell the human that execution is asynchronous and that they should later ask to check the result of this task_id. On the next relevant user message, the sender should check task status/result unless the user switched to an unrelated topic.",
-					"inputSchema": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"role":    map[string]any{"type": "string"},
-							"title":   map[string]any{"type": "string", "description": "Short task title (max 200 chars)"},
-							"task_md": map[string]any{"type": "string"},
-						},
-						"required": []string{"role", "title", "task_md"},
-					},
-				},
-				map[string]any{
-					"name":        "listen_role_async",
-					"description": "Poll once for one async task for this role. If a task is received, the worker should complete it, call solve_task with the same task_id, and then poll again for more tasks.",
-					"inputSchema": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"role": map[string]any{"type": "string"},
-						},
-						"required": []string{"role"},
-					},
-				},
-				map[string]any{
-					"name":        "get_task_status",
-					"description": "Check the current status of an async task by task_id. Use this when the sender needs to see whether queued work is still pending, picked, or solved.",
-					"inputSchema": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"task_id": map[string]any{"type": "string"},
-						},
-						"required": []string{"task_id"},
-					},
-				},
-				map[string]any{
-					"name":        "get_task_result",
-					"description": "Get the final markdown result for an async task by task_id. Senders should use this after create_task_async when the user asks to check progress or result on a later relevant message.",
-					"inputSchema": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"task_id": map[string]any{"type": "string"},
-						},
-						"required": []string{"task_id"},
-					},
-				},
-			)
-		}
-		// solve_task is always available if the server is running (at least one mode is on)
+		
+		// create_task is always available
 		tools = append(tools, map[string]any{
-			"name":        "solve_task",
-			"description": "Submit the final markdown report for a task. Workers that received a task via listen_role_sync or listen_role_async should always call this when work is complete before checking for the next task.",
+			"name":        "create_task",
+			"description": "Creates a task and returns immediately with a task_id.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"task_id":   map[string]any{"type": "string"},
-					"result_md": map[string]any{"type": "string"},
+					"role":    map[string]any{"type": "string"},
+					"title":   map[string]any{"type": "string", "description": "Short task title (max 200 chars)"},
+					"task_md": map[string]any{"type": "string"},
 				},
-				"required": []string{"task_id", "result_md"},
+				"required": []string{"role", "title", "task_md"},
 			},
 		})
+
+		if h.broker.EnableSync {
+			tools = append(tools, map[string]any{
+				"name":        "await_task",
+				"description": "Blocks until the task reaches a terminal state or timeout/cancel.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"task_id":    map[string]any{"type": "string"},
+						"timeout_ms": map[string]any{"type": "integer"},
+					},
+					"required": []string{"task_id"},
+				},
+			})
+		}
+
+		// listen_role schema adapted to flags
+		modes := []string{}
+		if h.broker.EnableSync {
+			modes = append(modes, "wait")
+		}
+		if h.broker.EnableAsync {
+			modes = append(modes, "poll")
+		}
+
+		tools = append(tools, map[string]any{
+			"name":        "listen_role",
+			"description": "Single worker-facing tool for both blocking wait and non-blocking check. Modes: wait, poll.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"role":       map[string]any{"type": "string"},
+					"mode":       map[string]any{"type": "string", "enum": modes},
+					"timeout_ms": map[string]any{"type": "integer"},
+				},
+				"required": []string{"role", "mode"},
+			},
+		})
+
+		// Discovery and management tools always available
+		tools = append(tools,
+			map[string]any{
+				"name":        "list_tasks",
+				"description": "Returns lightweight task metadata only. Filters allowed.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"role":   map[string]any{"type": "string"},
+						"status": map[string]any{"type": "string"},
+					},
+				},
+			},
+			map[string]any{
+				"name":        "get_task",
+				"description": "Returns detailed content for one task. Defaults to most useful payload to save context.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"task_id":           map[string]any{"type": "string"},
+						"include_task_md":   map[string]any{"type": "boolean"},
+						"include_result_md": map[string]any{"type": "boolean"},
+					},
+					"required": []string{"task_id"},
+				},
+			},
+			map[string]any{
+				"name":        "solve_task",
+				"description": "Submit the final markdown report for a task.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"task_id":   map[string]any{"type": "string"},
+						"result_md": map[string]any{"type": "string"},
+					},
+					"required": []string{"task_id", "result_md"},
+				},
+			},
+		)
 
 		result = map[string]any{
 			"tools": tools,
@@ -266,92 +268,141 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name string, args json.RawMessage) (any, error) {
 	switch name {
-	case "create_task_sync":
-		if !h.broker.EnableSync {
-			return nil, fmt.Errorf("tool \"create_task_sync\" is disabled by server configuration")
-		}
+	case "create_task":
 		var p struct {
-			Role    string `json:"role"`
-			Title   string `json:"title"`
-			TaskMD  string `json:"task_md"`
+			Role   string `json:"role"`
+			Title  string `json:"title"`
+			TaskMD string `json:"task_md"`
 		}
 		if err := json.Unmarshal(args, &p); err != nil || p.Role == "" || p.Title == "" || p.TaskMD == "" {
 			return nil, fmt.Errorf("invalid arguments: role, title and task_md are required")
 		}
-		taskID, res, err := h.broker.CreateTaskSync(ctx, projectID, p.Role, p.Title, p.TaskMD)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]string{"task_id": taskID, "result_md": res}, nil
-
-	case "create_task_async":
-		if !h.broker.EnableAsync {
-			return nil, fmt.Errorf("tool \"create_task_async\" is disabled by server configuration")
-		}
-		var p struct {
-			Role    string `json:"role"`
-			Title   string `json:"title"`
-			TaskMD  string `json:"task_md"`
-		}
-		if err := json.Unmarshal(args, &p); err != nil || p.Role == "" || p.Title == "" || p.TaskMD == "" {
-			return nil, fmt.Errorf("invalid arguments: role, title and task_md are required")
-		}
-		taskID, err := h.broker.CreateTaskAsync(projectID, p.Role, p.Title, p.TaskMD)
+		taskID, err := h.broker.CreateTask(projectID, p.Role, p.Title, p.TaskMD)
 		if err != nil {
 			return nil, err
 		}
 		return map[string]any{
-			"ok":      true,
-			"status":  "queued",
 			"task_id": taskID,
+			"status":  "queued",
 		}, nil
 
-	case "listen_role_sync":
+	case "await_task":
 		if !h.broker.EnableSync {
-			return nil, fmt.Errorf("tool \"listen_role_sync\" is disabled by server configuration")
+			return nil, fmt.Errorf("tool \"await_task\" is disabled by server configuration (ENABLE_SYNC=false)")
 		}
 		var p struct {
-			Role string `json:"role"`
+			TaskID    string `json:"task_id"`
+			TimeoutMs int    `json:"timeout_ms"`
 		}
-		if err := json.Unmarshal(args, &p); err != nil || p.Role == "" {
-			return nil, fmt.Errorf("invalid arguments: role is required")
+		if err := json.Unmarshal(args, &p); err != nil || p.TaskID == "" {
+			return nil, fmt.Errorf("invalid arguments: task_id is required")
 		}
-		task, err := h.broker.ListenRoleSync(ctx, projectID, p.Role)
+		status, res, err := h.broker.AwaitTask(ctx, projectID, p.TaskID, p.TimeoutMs)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]string{
-			"task_id": task.ID,
-			"title":   task.Title,
-			"task_md": task.MD,
-		}, nil
+		resp := map[string]any{
+			"task_id": p.TaskID,
+			"status":  status,
+		}
+		if status == string(StatusSolved) {
+			resp["result_md"] = res
+		}
+		return resp, nil
 
-	case "listen_role_async":
-		if !h.broker.EnableAsync {
-			return nil, fmt.Errorf("tool \"listen_role_async\" is disabled by server configuration")
-		}
+	case "listen_role":
 		var p struct {
-			Role string `json:"role"`
+			Role      string `json:"role"`
+			Mode      string `json:"mode"`
+			TimeoutMs int    `json:"timeout_ms"`
 		}
-		if err := json.Unmarshal(args, &p); err != nil || p.Role == "" {
-			return nil, fmt.Errorf("invalid arguments: role is required")
+		if err := json.Unmarshal(args, &p); err != nil || p.Role == "" || p.Mode == "" {
+			return nil, fmt.Errorf("invalid arguments: role and mode are required")
 		}
-		task, found, err := h.broker.ListenRoleAsync(projectID, p.Role)
+		
+		if p.Mode == "wait" && !h.broker.EnableSync {
+			return nil, fmt.Errorf("mode \"wait\" is disabled by server configuration (ENABLE_SYNC=false)")
+		}
+		if p.Mode == "poll" && !h.broker.EnableAsync {
+			return nil, fmt.Errorf("mode \"poll\" is disabled by server configuration (ENABLE_ASYNC=false)")
+		}
+
+		task, status, err := h.broker.ListenRole(ctx, projectID, p.Role, p.Mode, p.TimeoutMs)
 		if err != nil {
 			return nil, err
 		}
-		if !found {
+		
+		if task == nil {
 			return map[string]any{
-				"found":  false,
-				"status": "no_task",
+				"task":   nil,
+				"status": status, // "empty" or "timeout"
 			}, nil
 		}
+		
 		return map[string]any{
-			"found":   true,
-			"task_id": task.ID,
-			"title":   task.Title,
-			"task_md": task.MD,
+			"task": map[string]any{
+				"task_id": task.ID,
+				"title":   task.Title,
+				"task_md": task.MD,
+			},
 		}, nil
+
+	case "list_tasks":
+		var p struct {
+			Role   string `json:"role"`
+			Status string `json:"status"`
+		}
+		json.Unmarshal(args, &p) // ignoring error as all fields are optional
+		
+		tasks, err := h.broker.ListTasks(projectID, p.Role, p.Status)
+		if err != nil {
+			return nil, err
+		}
+		if tasks == nil {
+			tasks = make([]StatusMetadata, 0)
+		}
+		return map[string]any{
+			"tasks": tasks,
+		}, nil
+
+	case "get_task":
+		var p struct {
+			TaskID          string `json:"task_id"`
+			IncludeTaskMD   bool   `json:"include_task_md"`
+			IncludeResultMD bool   `json:"include_result_md"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil || p.TaskID == "" {
+			return nil, fmt.Errorf("invalid arguments: task_id is required")
+		}
+		
+		meta, err := h.broker.GetTaskStatus(projectID, p.TaskID)
+		if err != nil {
+			return nil, err
+		}
+		
+		resp := map[string]any{
+			"task_id": meta.TaskID,
+			"status":  meta.Status,
+		}
+		
+		needsTaskMD := p.IncludeTaskMD || (meta.Status != StatusSolved && !p.IncludeTaskMD && !p.IncludeResultMD)
+		needsResultMD := p.IncludeResultMD || (meta.Status == StatusSolved && !p.IncludeTaskMD && !p.IncludeResultMD)
+
+		if needsTaskMD {
+			md, err := h.broker.GetTaskMD(projectID, p.TaskID)
+			if err == nil {
+				resp["task_md"] = md
+			}
+		}
+		
+		if needsResultMD && meta.Status == StatusSolved {
+			res, err := h.broker.GetTaskResult(projectID, p.TaskID)
+			if err == nil {
+				resp["result_md"] = res
+			}
+		}
+		
+		return resp, nil
 
 	case "solve_task":
 		var p struct {
@@ -365,59 +416,6 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 			return nil, err
 		}
 		return map[string]bool{"ok": true}, nil
-
-	case "get_task_status":
-		if !h.broker.EnableAsync {
-			return nil, fmt.Errorf("tool \"get_task_status\" is disabled by server configuration")
-		}
-		var p struct {
-			TaskID string `json:"task_id"`
-		}
-		if err := json.Unmarshal(args, &p); err != nil || p.TaskID == "" {
-			return nil, fmt.Errorf("invalid arguments: task_id is required")
-		}
-		meta, err := h.broker.GetTaskStatus(projectID, p.TaskID)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{
-			"task_id": meta.TaskID,
-			"title":   meta.Title,
-			"status":  meta.Status,
-		}, nil
-
-	case "get_task_result":
-		if !h.broker.EnableAsync {
-			return nil, fmt.Errorf("tool \"get_task_result\" is disabled by server configuration")
-		}
-		var p struct {
-			TaskID string `json:"task_id"`
-		}
-		if err := json.Unmarshal(args, &p); err != nil || p.TaskID == "" {
-			return nil, fmt.Errorf("invalid arguments: task_id is required")
-		}
-		meta, err := h.broker.GetTaskStatus(projectID, p.TaskID)
-		if err != nil {
-			return nil, err
-		}
-		if meta.Status != StatusSolved {
-			return map[string]any{
-				"task_id":      meta.TaskID,
-				"title":        meta.Title,
-				"status":       meta.Status,
-				"result_ready": false,
-			}, nil
-		}
-		res, err := h.broker.GetTaskResult(projectID, p.TaskID)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{
-			"task_id":   meta.TaskID,
-			"title":     meta.Title,
-			"status":    meta.Status,
-			"result_md": res,
-		}, nil
 
 	default:
 		return nil, fmt.Errorf("tool not found: %s", name)

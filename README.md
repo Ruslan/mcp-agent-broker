@@ -1,299 +1,75 @@
-# Agent Broker
+# Agent Task Broker
 
-Minimal Go MCP/JSON-RPC broker for role-based task handoff between agents.
+A coordination layer for AI agents.
 
-## Run
+## Core Concepts
 
-Build the server:
+- **Tenancy**: Use the `X-Project-Id` HTTP header to isolate tasks between different projects.
+- **Roles**: Tasks are assigned to roles (e.g., `coder`, `researcher`).
+- **Lifecycle**: Create a task, optionally await its completion, and workers solve it.
 
-```bash
-cd agent-broker
-go build -o ../broker .
-```
+## MCP Tools
 
-Start the server:
+The broker implements the Model Context Protocol (MCP).
 
-```bash
-./broker
-```
+### `create_task`
+Creates a task and returns immediately.
+- **Arguments**:
+  - `role` (string): Target agent role.
+  - `title` (string): Short task title (max 200 chars).
+  - `task_md` (string): Detailed task description.
+- **Returns**: `task_id`, `status`.
 
-Default port: `9197`
+### `await_task`
+Blocks until the task is solved or timeout.
+- **Arguments**:
+  - `task_id` (string): ID of the task to wait for.
+  - `timeout_ms` (integer, optional): Maximum time to wait.
+- **Returns**: `task_id`, `status`, `result_md` (if solved).
 
-Custom port:
+### `listen_role`
+Worker-facing tool to fetch work.
+- **Arguments**:
+  - `role` (string): Role to listen for.
+  - `mode` (string): `wait` (blocking) or `poll` (immediate).
+  - `timeout_ms` (integer, optional): For `wait` mode.
+- **Returns**: `task` object or `status` (empty/timeout).
 
-```bash
-PORT=8080 ./broker
-```
+### `list_tasks`
+Overview of tasks in the current project.
+- **Arguments**:
+  - `role` (string, optional): Filter by role.
+  - `status` (string, optional): Filter by status.
+- **Returns**: List of task metadata.
 
-## MCP Server URL
+### `get_task`
+Detailed content for one task.
+- **Arguments**:
+  - `task_id` (string): ID of the task.
+  - `include_task_md` (boolean, optional).
+  - `include_result_md` (boolean, optional).
+- **Returns**: Task details (defaults to result if solved, prompt otherwise).
 
-Default MCP JSON-RPC endpoint:
+### `solve_task`
+Submit the result for a task.
+- **Arguments**:
+  - `task_id` (string): Task to resolve.
+  - `result_md` (string): Final output.
 
-```text
-http://localhost:9197/rpc
-```
+## Server Configuration
 
-If you set `PORT`, use:
+Control available features via environment variables:
 
-```text
-http://localhost:<PORT>/rpc
-```
+- `PORT`: Server port (default: `9197`).
+- `DATA_DIR`: Root directory for task persistence (default: `data`).
+- `ENABLE_SYNC`: Enable blocking tools (`await_task`, `listen_role` with `wait`). Default: `true`.
+- `ENABLE_ASYNC`: Enable polling tools (`listen_role` with `poll`). Default: `true`.
 
-Recommended MCP server name:
+Note: At least one mode must be enabled.
 
-```text
-agent-broker
-```
-
-## MCP Client Config
-
-### Gemini
-
-File: `./.gemini/settings.json`
-
-```json
-{
-  "mcpServers": {
-    "agent-broker": {
-      "httpUrl": "http://localhost:9197/rpc"
-    }
-  }
-}
-```
-
-### OpenCode
-
-File: `./.opencode/opencode.json`
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "agent-broker": {
-      "type": "remote",
-      "enabled": true,
-      "url": "http://localhost:9197/rpc"
-    }
-  }
-}
-```
-
-### Claude
-
-For `Claude Code`, add the server with:
+## Development
 
 ```bash
-claude mcp add --transport http agent-broker http://localhost:9197/rpc
+go build ./...
+go test ./...
 ```
-
-If your Claude client uses JSON config with `mcpServers`, use:
-
-```json
-{
-  "mcpServers": {
-    "agent-broker": {
-      "url": "http://localhost:9197/rpc"
-    }
-  }
-}
-```
-
-## Protocol
-
-The server exposes JSON-RPC 2.0 over HTTP and is intended to work as an MCP tool server.
-
-Available tools:
-
-1. `create_task_sync`
-2. `create_task_async`
-3. `listen_role_sync`
-4. `listen_role_async`
-5. `solve_task`
-
-## Sync Mode
-
-Use sync mode when the caller is allowed to block until the worker finishes.
-
-Flow:
-
-1. Worker calls `listen_role_sync`
-2. Orchestrator calls `create_task_sync`
-3. Worker receives the task
-4. Worker calls `solve_task`
-5. Original `create_task_sync` call returns the finished result
-
-### 1. Worker waits for a sync task
-
-```bash
-curl -s -X POST http://localhost:9197/rpc \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "tools/call",
-    "params": {
-      "name": "listen_role_sync",
-      "arguments": {
-        "role": "coder"
-      }
-    },
-    "id": 1
-  }'
-```
-
-### 2. Orchestrator sends a sync task
-
-```bash
-curl -s -X POST http://localhost:9197/rpc \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "tools/call",
-    "params": {
-      "name": "create_task_sync",
-      "arguments": {
-        "role": "coder",
-        "task_id": "sync-1",
-        "task_md": "Implement the requested change"
-      }
-    },
-    "id": 2
-  }'
-```
-
-This request may stay open for a long time until the worker finishes the task.
-
-### 3. Worker posts the result
-
-```bash
-curl -s -X POST http://localhost:9197/rpc \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "tools/call",
-    "params": {
-      "name": "solve_task",
-      "arguments": {
-        "task_id": "sync-1",
-        "result_md": "Done"
-      }
-    },
-    "id": 3
-  }'
-```
-
-## Async Mode
-
-Use async mode when you want inbox-style delivery and immediate responses.
-
-Flow:
-
-1. Orchestrator calls `create_task_async`
-2. Server queues the task and returns immediately
-3. Worker polls with `listen_role_async`
-4. Worker receives one queued task or `no_task`
-5. Worker calls `solve_task`
-
-In `v0.0.1`, async mode is fire-and-forget for the original sender. The sender gets `queued`, not the final result.
-
-### 1. Orchestrator queues an async task
-
-```bash
-curl -s -X POST http://localhost:9197/rpc \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "tools/call",
-    "params": {
-      "name": "create_task_async",
-      "arguments": {
-        "role": "coder",
-        "task_id": "async-1",
-        "task_md": "Review the attached plan"
-      }
-    },
-    "id": 4
-  }'
-```
-
-### 2. Worker polls for one async task
-
-```bash
-curl -s -X POST http://localhost:9197/rpc \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "tools/call",
-    "params": {
-      "name": "listen_role_async",
-      "arguments": {
-        "role": "coder"
-      }
-    },
-    "id": 5
-  }'
-```
-
-If a task exists, the response contains `found: true`, `task_id`, and `task_md`.
-
-If no task exists, the response contains:
-
-```json
-{
-  "found": false,
-  "status": "no_task"
-}
-```
-
-### 3. Worker posts the async result
-
-```bash
-curl -s -X POST http://localhost:9197/rpc \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "tools/call",
-    "params": {
-      "name": "solve_task",
-      "arguments": {
-        "task_id": "async-1",
-        "result_md": "Done"
-      }
-    },
-    "id": 6
-  }'
-```
-
-## MCP Handshake
-
-If your client expects MCP initialization, call:
-
-1. `initialize`
-2. `notifications/initialized`
-3. `tools/list`
-4. `tools/call`
-
-Example initialize request:
-
-```bash
-curl -s -X POST http://localhost:9197/rpc \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "initialize",
-    "params": {
-      "protocolVersion": "2024-11-05",
-      "capabilities": {},
-      "clientInfo": {
-        "name": "test-client",
-        "version": "1.0"
-      }
-    },
-    "id": 1
-  }'
-```
-
-## Notes
-
-1. `sync` mode is blocking by design.
-2. `async` mode is in-memory only.
-3. In `v0.0.1`, async tasks have no recovery, lease, or status API.

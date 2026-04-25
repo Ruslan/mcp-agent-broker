@@ -177,10 +177,159 @@ func (b *Broker) persistResult(projectID, taskID, resultMD string) error {
 	return nil
 }
 
-// ListenRoleSync registers a listener for a specific role and blocks until a task is assigned or context is cancelled.
-func (b *Broker) ListenRoleSync(ctx context.Context, projectID, role string) (*Task, error) {
+// CreateTask enqueues a task for a role and returns immediately with a generated ID.
+func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, error) {
+	if role == "" || title == "" || taskMD == "" {
+		return "", fmt.Errorf("role, title and task_md are required")
+	}
+	if len(title) > 200 {
+		return "", fmt.Errorf("title too long (max 200 characters)")
+	}
+
+	var taskID string
+	var err error
+
+	for i := 0; i < 5; i++ {
+		taskID = b.generateID()
+		err = b.persistTask(projectID, taskID, taskMD)
+		if err == nil {
+			break
+		}
+		if !strings.Contains(err.Error(), "already exists") {
+			return "", fmt.Errorf("persistence failed: %w", err)
+		}
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to generate unique task_id after 5 attempts: %w", err)
+	}
+
+	if err := b.persistStatus(projectID, taskID, role, title, StatusQueued); err != nil {
+		os.RemoveAll(b.taskDir(projectID, taskID))
+		return "", fmt.Errorf("failed to persist status: %w", err)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	task := &Task{
+		ID:        taskID,
+		ProjectID: projectID,
+		Role:      role,
+		Title:     title,
+		MD:        taskMD,
+		done:      make(chan string, 1),
+	}
+	if b.tasks[projectID] == nil {
+		b.tasks[projectID] = make(map[string]*Task)
+	}
+	b.tasks[projectID][taskID] = task
+
+	// If a listener is waiting, deliver directly
+	if projectListeners, ok := b.listeners[projectID]; ok {
+		if ch, hasListener := projectListeners[role]; hasListener {
+			// Mark as picked on disk before attempting delivery
+			if err := b.persistStatus(projectID, taskID, role, title, StatusPicked); err != nil {
+				os.RemoveAll(b.taskDir(projectID, taskID))
+				return "", fmt.Errorf("failed to update status to picked: %w", err)
+			}
+
+			select {
+			case ch <- task:
+				return taskID, nil
+			default:
+				// Listener was busy/disappeared, rollback status on disk to queued
+				if err := b.persistStatus(projectID, taskID, role, title, StatusQueued); err != nil {
+					// Log but continue to ensure task is at least in the async queue
+				}
+			}
+		}
+	}
+
+	if b.asyncQueue[projectID] == nil {
+		b.asyncQueue[projectID] = make(map[string][]*Task)
+	}
+	b.asyncQueue[projectID][role] = append(b.asyncQueue[projectID][role], task)
+
+	return taskID, nil
+}
+
+// AwaitTask blocks until the task reaches a terminal state or timeout/cancel.
+func (b *Broker) AwaitTask(ctx context.Context, projectID, taskID string, timeoutMs int) (string, string, error) {
+	if taskID == "" {
+		return "", "", fmt.Errorf("task_id is required")
+	}
+	if !isSafeID(taskID) {
+		return "", "", fmt.Errorf("invalid task_id")
+	}
+
+	// First check disk to see if it's already solved
+	meta, err := b.GetTaskStatus(projectID, taskID)
+	if err != nil {
+		return "", "", err
+	}
+	if meta.Status == StatusSolved {
+		res, err := b.GetTaskResult(projectID, taskID)
+		if err == nil {
+			return string(meta.Status), res, nil
+		}
+	}
+
+	b.mu.Lock()
+	projectTasks, ok := b.tasks[projectID]
+	if !ok {
+		b.mu.Unlock()
+		return string(meta.Status), "", nil
+	}
+	task, exists := projectTasks[taskID]
+	b.mu.Unlock()
+
+	if !exists {
+		meta, err = b.GetTaskStatus(projectID, taskID)
+		if err != nil {
+			return "", "", err
+		}
+		if meta.Status == StatusSolved {
+			res, err := b.GetTaskResult(projectID, taskID)
+			return string(meta.Status), res, err
+		}
+		return string(meta.Status), "", nil
+	}
+
+	var timeoutCh <-chan time.Time
+	if timeoutMs > 0 {
+		timeoutCh = time.After(time.Duration(timeoutMs) * time.Millisecond)
+	}
+
+	select {
+	case res := <-task.done:
+		// Re-send to channel so subsequent AwaitTasks can also get it
+		select {
+		case task.done <- res:
+		default:
+		}
+		return string(StatusSolved), res, nil
+	case <-ctx.Done():
+		meta, _ = b.GetTaskStatus(projectID, taskID)
+		if meta != nil {
+			return string(meta.Status), "", ctx.Err()
+		}
+		return "", "", ctx.Err()
+	case <-timeoutCh:
+		meta, _ = b.GetTaskStatus(projectID, taskID)
+		if meta != nil {
+			return string(meta.Status), "", nil
+		}
+		return "", "", fmt.Errorf("task %q not found after timeout", taskID)
+	}
+}
+
+// ListenRole handles both blocking wait and non-blocking poll.
+func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, timeoutMs int) (*Task, string, error) {
 	if role == "" {
-		return nil, fmt.Errorf("role name cannot be empty")
+		return nil, "", fmt.Errorf("role name cannot be empty")
+	}
+	if mode != "poll" && mode != "wait" {
+		return nil, "", fmt.Errorf("invalid mode: %q (must be 'poll' or 'wait')", mode)
 	}
 
 	b.mu.Lock()
@@ -189,22 +338,27 @@ func (b *Broker) ListenRoleSync(ctx context.Context, projectID, role string) (*T
 		if queue := projectQueue[role]; len(queue) > 0 {
 			task := queue[0]
 			
-			// Update status to picked before handing it out
 			if err := b.persistStatus(projectID, task.ID, role, task.Title, StatusPicked); err != nil {
 				b.mu.Unlock()
-				return nil, fmt.Errorf("failed to update status to picked for async task: %w", err)
+				return nil, "", fmt.Errorf("failed to update status to picked: %w", err)
 			}
 
 			projectQueue[role] = queue[1:]
 			b.mu.Unlock()
-			return task, nil
+			return task, "picked", nil
 		}
 	}
 
+	if mode == "poll" {
+		b.mu.Unlock()
+		return nil, "empty", nil
+	}
+
+	// Mode is wait
 	if projectListeners, ok := b.listeners[projectID]; ok {
 		if _, exists := projectListeners[role]; exists {
 			b.mu.Unlock()
-			return nil, fmt.Errorf("role %q already has a listener in project %q", role, projectID)
+			return nil, "", fmt.Errorf("role %q already has a listener in project %q", role, projectID)
 		}
 	} else {
 		b.listeners[projectID] = make(map[string]chan *Task)
@@ -225,231 +379,19 @@ func (b *Broker) ListenRoleSync(ctx context.Context, projectID, role string) (*T
 		b.mu.Unlock()
 	}()
 
+	var timeoutCh <-chan time.Time
+	if timeoutMs > 0 {
+		timeoutCh = time.After(time.Duration(timeoutMs) * time.Millisecond)
+	}
+
 	select {
 	case task := <-ch:
-		return task, nil
+		return task, "picked", nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, "", ctx.Err()
+	case <-timeoutCh:
+		return nil, "timeout", nil
 	}
-}
-
-// ListenRoleAsync checks the async inbox for the role once and returns a task if found.
-func (b *Broker) ListenRoleAsync(projectID, role string) (*Task, bool, error) {
-	if role == "" {
-		return nil, false, fmt.Errorf("role name cannot be empty")
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	projectQueue, ok := b.asyncQueue[projectID]
-	if !ok {
-		return nil, false, nil
-	}
-	queue := projectQueue[role]
-	if len(queue) == 0 {
-		return nil, false, nil
-	}
-
-	task := queue[0]
-	
-	// Update status to picked before handing it out
-	if err := b.persistStatus(projectID, task.ID, role, task.Title, StatusPicked); err != nil {
-		return nil, false, fmt.Errorf("failed to update status to picked: %w", err)
-	}
-
-	projectQueue[role] = queue[1:]
-	return task, true, nil
-}
-
-// CreateTaskSync creates a task for a role and blocks until it is solved or context is cancelled.
-func (b *Broker) CreateTaskSync(ctx context.Context, projectID, role, title, taskMD string) (string, string, error) {
-	if role == "" || title == "" || taskMD == "" {
-		return "", "", fmt.Errorf("role, title and task_md are required")
-	}
-	if len(title) > 200 {
-		return "", "", fmt.Errorf("title too long (max 200 characters)")
-	}
-
-	var taskID string
-	var err error
-
-	// Retry on collision (ID already exists on disk)
-	for i := 0; i < 5; i++ {
-		taskID = b.generateID()
-		err = b.persistTask(projectID, taskID, taskMD)
-		if err == nil {
-			break
-		}
-		// If it's anything other than "already exists", fail immediately
-		if !strings.Contains(err.Error(), "already exists") {
-			return "", "", fmt.Errorf("persistence failed: %w", err)
-		}
-	}
-	if err != nil {
-		return "", "", fmt.Errorf("failed to generate unique task_id after 5 attempts: %w", err)
-	}
-
-	b.mu.Lock()
-	projectListeners, hasProject := b.listeners[projectID]
-	if !hasProject {
-		b.mu.Unlock()
-		os.RemoveAll(b.taskDir(projectID, taskID))
-		return "", "", fmt.Errorf("role %q has no listener in project %q, ask user to clarify the role", role, projectID)
-	}
-	ch, hasListener := projectListeners[role]
-	if !hasListener {
-		b.mu.Unlock()
-		os.RemoveAll(b.taskDir(projectID, taskID))
-		return "", "", fmt.Errorf("role %q has no listener in project %q, ask user to clarify the role", role, projectID)
-	}
-	b.mu.Unlock()
-
-	// Sync tasks also get status for consistency in v0.0.3 queries
-	if err := b.persistStatus(projectID, taskID, role, title, StatusQueued); err != nil {
-		os.RemoveAll(b.taskDir(projectID, taskID)) // Cleanup partial state
-		return "", "", fmt.Errorf("failed to persist status: %w", err)
-	}
-
-	b.mu.Lock()
-	projectListeners, hasProject = b.listeners[projectID]
-	if !hasProject {
-		b.mu.Unlock()
-		os.RemoveAll(b.taskDir(projectID, taskID))
-		return "", "", fmt.Errorf("project %q listeners disappeared", projectID)
-	}
-	ch, hasListener = projectListeners[role]
-	if !hasListener {
-		b.mu.Unlock()
-		os.RemoveAll(b.taskDir(projectID, taskID))
-		return "", "", fmt.Errorf("role %q listener in project %q disappeared", role, projectID)
-	}
-
-	task := &Task{
-		ID:        taskID,
-		ProjectID: projectID,
-		Role:      role,
-		Title:     title,
-		MD:        taskMD,
-		done:      make(chan string, 1),
-	}
-	if b.tasks[projectID] == nil {
-		b.tasks[projectID] = make(map[string]*Task)
-	}
-	b.tasks[projectID][taskID] = task
-
-	delivered := false
-	select {
-	case ch <- task:
-		delivered = true
-	default:
-	}
-
-	if !delivered {
-		delete(b.tasks[projectID], taskID)
-		if len(b.tasks[projectID]) == 0 {
-			delete(b.tasks, projectID)
-		}
-		b.mu.Unlock()
-		os.RemoveAll(b.taskDir(projectID, taskID))
-		return "", "", fmt.Errorf("role %q in project %q is busy", role, projectID)
-	}
-	b.mu.Unlock()
-
-	// Update status to picked immediately since sync delivery is a direct handoff
-	if err := b.persistStatus(projectID, taskID, role, title, StatusPicked); err != nil {
-		// Log error but continue as task was delivered
-	}
-
-	defer func() {
-		b.mu.Lock()
-		if projectTasks, ok := b.tasks[projectID]; ok {
-			delete(projectTasks, taskID)
-			if len(projectTasks) == 0 {
-				delete(b.tasks, projectID)
-			}
-		}
-		b.mu.Unlock()
-	}()
-
-	select {
-	case result := <-task.done:
-		return taskID, result, nil
-	case <-ctx.Done():
-		return "", "", ctx.Err()
-	}
-}
-
-// CreateTaskAsync enqueues a task for a role and returns immediately with a generated ID.
-func (b *Broker) CreateTaskAsync(projectID, role, title, taskMD string) (string, error) {
-	if role == "" || title == "" || taskMD == "" {
-		return "", fmt.Errorf("role, title and task_md are required")
-	}
-	if len(title) > 200 {
-		return "", fmt.Errorf("title too long (max 200 characters)")
-	}
-
-	var taskID string
-	var err error
-
-	// Retry on collision (ID already exists on disk)
-	for i := 0; i < 5; i++ {
-		taskID = b.generateID()
-		err = b.persistTask(projectID, taskID, taskMD)
-		if err == nil {
-			break
-		}
-		// If it's anything other than "already exists", fail immediately
-		if !strings.Contains(err.Error(), "already exists") {
-			return "", fmt.Errorf("persistence failed: %w", err)
-		}
-	}
-	if err != nil {
-		return "", fmt.Errorf("failed to generate unique task_id after 5 attempts: %w", err)
-	}
-
-	if err := b.persistStatus(projectID, taskID, role, title, StatusQueued); err != nil {
-		os.RemoveAll(b.taskDir(projectID, taskID)) // Cleanup partial state
-		return "", fmt.Errorf("failed to persist status: %w", err)
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	// No need to check exists in b.tasks because of generateTaskID + O_EXCL in persistTask
-	// unless we really hit a 1 in 2^128 collision with an active memory task.
-
-	task := &Task{
-		ID:        taskID,
-		ProjectID: projectID,
-		Role:      role,
-		Title:     title,
-		MD:        taskMD,
-		done:      make(chan string, 1),
-	}
-	if b.tasks[projectID] == nil {
-		b.tasks[projectID] = make(map[string]*Task)
-	}
-	b.tasks[projectID][taskID] = task
-
-	// If a sync listener is already waiting for this role, deliver directly.
-	if projectListeners, ok := b.listeners[projectID]; ok {
-		if ch, hasListener := projectListeners[role]; hasListener {
-			if err := b.persistStatus(projectID, taskID, role, title, StatusPicked); err == nil {
-				select {
-				case ch <- task:
-					return taskID, nil
-				default:
-				}
-			}
-		}
-	}
-
-	if b.asyncQueue[projectID] == nil {
-		b.asyncQueue[projectID] = make(map[string][]*Task)
-	}
-	b.asyncQueue[projectID][role] = append(b.asyncQueue[projectID][role], task)
-
-	return taskID, nil
 }
 
 // SolveTask submits a result for a task ID and unblocks the creator.
@@ -530,4 +472,54 @@ func (b *Broker) GetTaskResult(projectID, taskID string) (string, error) {
 		return "", fmt.Errorf("failed to read result: %w", err)
 	}
 	return string(data), nil
+}
+
+func (b *Broker) GetTaskMD(projectID, taskID string) (string, error) {
+	if !isSafeID(taskID) {
+		return "", fmt.Errorf("invalid task_id")
+	}
+	path := filepath.Join(b.taskDir(projectID, taskID), "task.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to read task.md: %w", err)
+	}
+	return string(data), nil
+}
+
+func (b *Broker) ListTasks(projectID, role, status string) ([]StatusMetadata, error) {
+	var tasks []StatusMetadata
+	
+	dir := filepath.Join(b.dataDir, projectID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return tasks, nil
+		}
+		return nil, fmt.Errorf("failed to read project dir: %w", err)
+	}
+	
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		taskID := entry.Name()
+		if !isSafeID(taskID) {
+			continue
+		}
+		
+		meta, err := b.GetTaskStatus(projectID, taskID)
+		if err != nil {
+			continue // Skip errors
+		}
+		
+		if role != "" && meta.Role != role {
+			continue
+		}
+		if status != "" && string(meta.Status) != status {
+			continue
+		}
+		
+		tasks = append(tasks, *meta)
+	}
+	return tasks, nil
 }

@@ -18,11 +18,11 @@ Your job is:
 
 Repeat this loop:
 
-1. call `listen_role_async` for role `coder`
-2. if no task is returned, stay idle and check again later
+1. call `listen_role` with `role="coder"` and `mode="poll"`
+2. if `task=null` and `status="empty"`, stay idle and check again later
 3. if a task is returned, complete it
 4. call `solve_task` with the same `task_id`
-5. immediately poll again for more tasks
+5. poll again for more tasks
 
 ## Required behavior
 
@@ -55,9 +55,10 @@ Your `solve_task` report should usually include:
 
 ## MCP tools you use
 
-1. `listen_role_async`
+1. `listen_role` with `mode="poll"`
 2. `solve_task`
 
-## Important rule
+## Important rules
 
-After finishing a task, always send the report with `solve_task` before checking for the next task.
+1. After finishing a task, always send the report with `solve_task` before checking for the next task
+2. If async mode is disabled by server configuration, report that `poll` mode is unavailable instead of inventing a workaround
