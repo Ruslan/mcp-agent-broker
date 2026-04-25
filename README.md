@@ -71,12 +71,15 @@ http://localhost:9197/health
 
 ## Environment
 
+The server automatically loads environment variables from a `.env` file in the current working directory if it exists.
+
 Supported environment variables:
 
 1. `PORT`: server port, default `9197`
 2. `DATA_DIR`: persistence root, default `data`
-3. `ENABLE_SYNC`: enables `await_task` and `listen_role(mode="wait")`, default `true`
-4. `ENABLE_ASYNC`: enables `listen_role(mode="poll")`, default `true`
+3. `API_KEY`: optional API key for authentication. If set, clients must use `Authorization: Bearer <key>` header.
+4. `ENABLE_SYNC`: enables `await_task` and `listen_role(mode="wait")`, default `true`
+5. `ENABLE_ASYNC`: enables `listen_role(mode="poll")`, default `true`
 
 At least one of `ENABLE_SYNC` or `ENABLE_ASYNC` must stay enabled.
 
