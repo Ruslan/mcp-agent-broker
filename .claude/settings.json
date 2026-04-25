@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "agent-broker": {
+      "url": "http://localhost:9197/rpc"
+    }
+  }
+}

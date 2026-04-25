@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(curl:*)",
+      "Bash(claude mcp:*)",
+      "mcp__agent-broker-test__listen_role_async",
+      "Bash(go test:*)",
+      "mcp__agent-broker-test__solve_task"
+    ]
+  }
+}

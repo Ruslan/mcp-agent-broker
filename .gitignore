@@ -1,0 +1,12 @@
+broker
+agent-broker/agent-broker
+agent-broker/agent-broker-bin
+agent-broker/*.orig
+
+data/*
+!data/.keep
+
+task-data/
+task-data*/
+
+.gemini/*.log
