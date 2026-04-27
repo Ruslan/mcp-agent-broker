@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -648,6 +649,8 @@ func (b *Broker) findPromptTemplate(name string) (promptTemplate, error) {
 	return promptTemplate{}, fmt.Errorf("prompt %q not found", name)
 }
 
+var frontMatterRegex = regexp.MustCompile(`(?s)^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n?(.*)`)
+
 func parsePromptTemplate(path string) (promptTemplate, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -656,15 +659,12 @@ func parsePromptTemplate(path string) (promptTemplate, error) {
 
 	body := string(data)
 	tmpl := promptTemplate{Path: path}
-	if strings.HasPrefix(body, "---\n") {
-		parts := strings.SplitN(body, "\n---\n", 2)
-		if len(parts) != 2 {
-			return promptTemplate{}, fmt.Errorf("invalid front matter in %s", filepath.Base(path))
-		}
-		if err := yaml.Unmarshal([]byte(strings.TrimPrefix(parts[0], "---\n")), &tmpl.promptFrontMatter); err != nil {
+
+	if match := frontMatterRegex.FindStringSubmatch(body); match != nil {
+		if err := yaml.Unmarshal([]byte(match[1]), &tmpl.promptFrontMatter); err != nil {
 			return promptTemplate{}, fmt.Errorf("failed to parse prompt front matter in %s: %w", filepath.Base(path), err)
 		}
-		body = parts[1]
+		body = match[2]
 	}
 
 	if tmpl.Name == "" {

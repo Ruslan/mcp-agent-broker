@@ -162,7 +162,10 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				rpcErr = &RPCError{Code: ErrApp, Message: err.Error()}
 			} else {
 				result = map[string]any{
+					"name":        prompt.Name,
+					"title":       prompt.Title,
 					"description": prompt.Description,
+					"arguments":   prompt.Arguments,
 					"messages": []any{
 						map[string]any{
 							"role": "user",

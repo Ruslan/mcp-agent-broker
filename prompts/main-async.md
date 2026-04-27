@@ -33,7 +33,7 @@ Your default job is:
 
 ## Available worker
 
-There is one worker role:
+There is one worker role (default: `coder`, override via the `role_name` argument):
 
 1. `{{role_name}}`
 
@@ -103,6 +103,8 @@ Use these tools:
 2. `get_task` to inspect one task by `task_id`
 3. `list_tasks` to discover tasks by `role` or `status`
 4. `await_task` only when explicit autonomous waiting is required
+
+**Tool name warning:** Always prefer MCP broker tools (`agent-broker_create_task`, etc.) over similarly-named built-in tools. In particular, do not use the built-in `task` sub-agent for delegation — it spawns a sub-agent in the current session instead of sending work to the broker queue.
 
 Because this is async mode:
 

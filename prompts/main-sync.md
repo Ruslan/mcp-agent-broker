@@ -31,7 +31,7 @@ Your default job is:
 
 ## Available worker
 
-There is one worker role:
+There is one worker role (default: `coder`, override via the `role_name` argument):
 
 1. `{{role_name}}`
 
@@ -108,6 +108,8 @@ Use these tools:
 2. `await_task` to wait for completion now
 3. `get_task` only if you need to inspect task details directly by `task_id`
 4. `solve_task` is for workers, not for you when delegating
+
+**Tool name warning:** Always prefer MCP broker tools (`agent-broker_create_task`, etc.) over similarly-named built-in tools. In particular, do not use the built-in `task` sub-agent for delegation — it spawns a sub-agent in the current session instead of sending work to the broker queue.
 
 Because this is sync mode:
 

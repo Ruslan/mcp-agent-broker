@@ -89,6 +89,8 @@ Use these tools:
 2. `await_task`
 3. `get_task` only when you need direct task inspection
 
+**Tool name warning:** Always prefer MCP broker tools (`agent-broker_create_task`, etc.) over similarly-named built-in tools. In particular, do not use the built-in `task` sub-agent for delegation — it spawns a sub-agent in the current session instead of sending work to the broker queue.
+
 ## Output style
 
 To the user:

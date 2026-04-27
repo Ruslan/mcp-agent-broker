@@ -203,7 +203,7 @@ func TestJSONRPC_ServeHTTP_ToolCalls(t *testing.T) {
 			name:   "prompts/get",
 			method: "prompts/get",
 			params: map[string]any{
-				"name": "coder-async",
+				"name":      "coder-async",
 				"arguments": map[string]string{},
 			},
 		},
