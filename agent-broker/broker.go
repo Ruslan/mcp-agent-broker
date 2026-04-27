@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -55,6 +58,7 @@ type Broker struct {
 	tasks      map[string]map[string]*Task      // projectID -> taskID -> *Task
 	asyncQueue map[string]map[string][]*Task    // projectID -> role -> []*Task
 	dataDir    string
+	promptsDir string
 
 	EnableSync  bool
 	EnableAsync bool
@@ -65,12 +69,18 @@ type Broker struct {
 }
 
 // NewBroker initializes and returns a new Broker with persistence support.
-func NewBroker(dataDir string, enableSync, enableAsync bool) (*Broker, error) {
+func NewBroker(dataDir, promptsDir string, enableSync, enableAsync bool) (*Broker, error) {
 	if dataDir == "" {
 		dataDir = "data"
 	}
+	if promptsDir == "" {
+		promptsDir = "prompts"
+	}
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
+	}
+	if err := os.MkdirAll(promptsDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create prompts directory: %w", err)
 	}
 
 	b := &Broker{
@@ -78,6 +88,7 @@ func NewBroker(dataDir string, enableSync, enableAsync bool) (*Broker, error) {
 		tasks:       make(map[string]map[string]*Task),
 		asyncQueue:  make(map[string]map[string][]*Task),
 		dataDir:     dataDir,
+		promptsDir:  promptsDir,
 		EnableSync:  enableSync,
 		EnableAsync: enableAsync,
 	}
@@ -119,7 +130,7 @@ func (b *Broker) persistTask(projectID, taskID, taskMD string) error {
 		return fmt.Errorf("failed to create task directory: %w", err)
 	}
 	path := filepath.Join(dir, "task.md")
-	
+
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		if os.IsExist(err) {
@@ -128,7 +139,7 @@ func (b *Broker) persistTask(projectID, taskID, taskMD string) error {
 		return fmt.Errorf("failed to create task.md: %w", err)
 	}
 	defer f.Close()
-	
+
 	if _, err := f.Write([]byte(taskMD)); err != nil {
 		return fmt.Errorf("failed to write task.md: %w", err)
 	}
@@ -138,7 +149,7 @@ func (b *Broker) persistTask(projectID, taskID, taskMD string) error {
 func (b *Broker) defaultPersistStatus(projectID, taskID, role, title string, status TaskStatus) error {
 	dir := b.taskDir(projectID, taskID)
 	path := filepath.Join(dir, "status.json")
-	
+
 	var meta StatusMetadata
 	now := time.Now().UTC()
 
@@ -156,15 +167,15 @@ func (b *Broker) defaultPersistStatus(projectID, taskID, role, title string, sta
 		meta.Title = title
 		meta.CreatedAt = now
 	}
-	
+
 	meta.Status = status
 	meta.UpdatedAt = now
-	
+
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal status: %w", err)
 	}
-	
+
 	return os.WriteFile(path, data, 0644)
 }
 
@@ -337,7 +348,7 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 	if projectQueue, ok := b.asyncQueue[projectID]; ok {
 		if queue := projectQueue[role]; len(queue) > 0 {
 			task := queue[0]
-			
+
 			if err := b.persistStatus(projectID, task.ID, role, task.Title, StatusPicked); err != nil {
 				b.mu.Unlock()
 				return nil, "", fmt.Errorf("failed to update status to picked: %w", err)
@@ -488,7 +499,7 @@ func (b *Broker) GetTaskMD(projectID, taskID string) (string, error) {
 
 func (b *Broker) ListTasks(projectID, role, status string) ([]StatusMetadata, error) {
 	var tasks []StatusMetadata
-	
+
 	dir := filepath.Join(b.dataDir, projectID)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -497,7 +508,7 @@ func (b *Broker) ListTasks(projectID, role, status string) ([]StatusMetadata, er
 		}
 		return nil, fmt.Errorf("failed to read project dir: %w", err)
 	}
-	
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -506,20 +517,187 @@ func (b *Broker) ListTasks(projectID, role, status string) ([]StatusMetadata, er
 		if !isSafeID(taskID) {
 			continue
 		}
-		
+
 		meta, err := b.GetTaskStatus(projectID, taskID)
 		if err != nil {
 			continue // Skip errors
 		}
-		
+
 		if role != "" && meta.Role != role {
 			continue
 		}
 		if status != "" && string(meta.Status) != status {
 			continue
 		}
-		
+
 		tasks = append(tasks, *meta)
 	}
 	return tasks, nil
+}
+
+// PromptMetadata represents basic information about a prompt.
+type PromptMetadata struct {
+	Name        string                   `json:"name"`
+	Title       string                   `json:"title,omitempty"`
+	Description string                   `json:"description,omitempty"`
+	Arguments   []PromptArgumentMetadata `json:"arguments,omitempty"`
+}
+
+// PromptArgumentMetadata describes one prompt argument.
+type PromptArgumentMetadata struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Required    bool   `json:"required,omitempty"`
+}
+
+type promptFrontMatter struct {
+	Name        string                   `yaml:"name"`
+	Title       string                   `yaml:"title"`
+	Description string                   `yaml:"description"`
+	Order       int                      `yaml:"order"`
+	Arguments   []PromptArgumentMetadata `yaml:"arguments"`
+}
+
+type promptTemplate struct {
+	promptFrontMatter
+	Body string
+	Path string
+}
+
+// ListPrompts scans the prompts directory for markdown files.
+func (b *Broker) ListPrompts() ([]PromptMetadata, error) {
+	entries, err := os.ReadDir(b.promptsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []PromptMetadata{}, nil
+		}
+		return nil, fmt.Errorf("failed to read prompts directory: %w", err)
+	}
+
+	var templates []promptTemplate
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		tmpl, err := parsePromptTemplate(filepath.Join(b.promptsDir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		templates = append(templates, tmpl)
+	}
+
+	sort.Slice(templates, func(i, j int) bool {
+		if templates[i].Order != templates[j].Order {
+			return templates[i].Order < templates[j].Order
+		}
+		return templates[i].Name < templates[j].Name
+	})
+
+	prompts := make([]PromptMetadata, 0, len(templates))
+	for _, tmpl := range templates {
+		prompts = append(prompts, PromptMetadata{
+			Name:        tmpl.Name,
+			Title:       tmpl.Title,
+			Description: tmpl.Description,
+			Arguments:   tmpl.Arguments,
+		})
+	}
+	return prompts, nil
+}
+
+// GetPrompt returns the content of a specific prompt file.
+func (b *Broker) GetPrompt(name string, arguments map[string]string) (PromptMetadata, string, error) {
+	if !isSafeID(name) {
+		return PromptMetadata{}, "", fmt.Errorf("invalid prompt name")
+	}
+	tmpl, err := b.findPromptTemplate(name)
+	if err != nil {
+		return PromptMetadata{}, "", err
+	}
+	meta := PromptMetadata{
+		Name:        tmpl.Name,
+		Title:       tmpl.Title,
+		Description: tmpl.Description,
+		Arguments:   tmpl.Arguments,
+	}
+	return meta, renderPromptTemplate(tmpl.Body, arguments), nil
+}
+
+func (b *Broker) findPromptTemplate(name string) (promptTemplate, error) {
+	entries, err := os.ReadDir(b.promptsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return promptTemplate{}, fmt.Errorf("prompt %q not found", name)
+		}
+		return promptTemplate{}, fmt.Errorf("failed to read prompts directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		tmpl, err := parsePromptTemplate(filepath.Join(b.promptsDir, entry.Name()))
+		if err != nil {
+			return promptTemplate{}, err
+		}
+		if tmpl.Name == name {
+			return tmpl, nil
+		}
+	}
+
+	return promptTemplate{}, fmt.Errorf("prompt %q not found", name)
+}
+
+func parsePromptTemplate(path string) (promptTemplate, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return promptTemplate{}, fmt.Errorf("failed to read prompt: %w", err)
+	}
+
+	body := string(data)
+	tmpl := promptTemplate{Path: path}
+	if strings.HasPrefix(body, "---\n") {
+		parts := strings.SplitN(body, "\n---\n", 2)
+		if len(parts) != 2 {
+			return promptTemplate{}, fmt.Errorf("invalid front matter in %s", filepath.Base(path))
+		}
+		if err := yaml.Unmarshal([]byte(strings.TrimPrefix(parts[0], "---\n")), &tmpl.promptFrontMatter); err != nil {
+			return promptTemplate{}, fmt.Errorf("failed to parse prompt front matter in %s: %w", filepath.Base(path), err)
+		}
+		body = parts[1]
+	}
+
+	if tmpl.Name == "" {
+		tmpl.Name = strings.TrimSuffix(filepath.Base(path), ".md")
+	}
+	if tmpl.Title == "" {
+		tmpl.Title = tmpl.Name
+	}
+	if tmpl.Description == "" {
+		tmpl.Description = fmt.Sprintf("Ralph Methodology: %s", tmpl.Title)
+	}
+	tmpl.Body = body
+	return tmpl, nil
+}
+
+func renderPromptTemplate(body string, arguments map[string]string) string {
+	if arguments == nil {
+		arguments = map[string]string{}
+	}
+	roleName := strings.TrimSpace(arguments["role_name"])
+	if roleName == "" {
+		roleName = "coder"
+	}
+	replacements := make(map[string]string, len(arguments)+1)
+	replacements["{{role_name}}"] = roleName
+	for key, value := range arguments {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		replacements[fmt.Sprintf("{{%s}}", key)] = value
+	}
+	for placeholder, value := range replacements {
+		body = strings.ReplaceAll(body, placeholder, value)
+	}
+	return body
 }

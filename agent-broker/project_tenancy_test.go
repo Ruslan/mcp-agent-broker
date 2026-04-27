@@ -14,7 +14,7 @@ func TestProjectTenancy_Isolation(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-tenancy-*")
 	defer os.RemoveAll(tmpDir)
 
-	broker, _ := NewBroker(tmpDir, true, true)
+	broker, _ := NewBroker(tmpDir, "", true, true)
 	handler := &JSONRPCHandler{broker: broker}
 
 	projA := "project-a"
@@ -69,14 +69,14 @@ func TestProjectTenancy_Isolation(t *testing.T) {
 		}
 		data, _ := json.Marshal(res.Result)
 		json.Unmarshal(data, &taskResp)
-		
+
 		var payload struct {
 			Task struct {
 				Title string `json:"title"`
 			} `json:"task"`
 		}
 		json.Unmarshal([]byte(taskResp.Content[0].Text), &payload)
-		
+
 		if payload.Task.Title != "Task A" {
 			t.Errorf("Project A listener got wrong task: %v", payload.Task.Title)
 		}
@@ -112,7 +112,7 @@ func TestProjectTenancy_Isolation(t *testing.T) {
 		}
 		data, _ := json.Marshal(res.Result)
 		json.Unmarshal(data, &taskResp)
-		
+
 		var payload struct {
 			Task struct {
 				Title string `json:"title"`
@@ -132,7 +132,7 @@ func TestProjectTenancy_InvalidProjectID(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-invalid-proj-*")
 	defer os.RemoveAll(tmpDir)
 
-	broker, _ := NewBroker(tmpDir, true, true)
+	broker, _ := NewBroker(tmpDir, "", true, true)
 	handler := &JSONRPCHandler{broker: broker}
 
 	req := Request{
@@ -141,7 +141,7 @@ func TestProjectTenancy_InvalidProjectID(t *testing.T) {
 		Params:  json.RawMessage(`{"name":"listen_role","arguments":{"role":"coder","mode":"poll"}}`),
 		ID:      json.RawMessage(`"1"`),
 	}
-	
+
 	// Invalid project ID (contains separator)
 	res := callHandler(handler, req, "proj/a")
 	if res.Error == nil || !strings.Contains(res.Error.Message, "Invalid project_id") {
@@ -153,7 +153,7 @@ func TestProjectTenancy_InvalidProjectID(t *testing.T) {
 	rHealth := httptest.NewRequest("GET", "/health", nil)
 	rHealth.Header.Set("X-Project-Id", "proj/a")
 	handler.HealthHandler(wHealth, rHealth)
-	
+
 	var resHealth Response
 	json.Unmarshal(wHealth.Body.Bytes(), &resHealth)
 	if resHealth.Error == nil || !strings.Contains(resHealth.Error.Message, "Invalid project_id") {
@@ -164,13 +164,13 @@ func TestProjectTenancy_InvalidProjectID(t *testing.T) {
 	// We'll use a short timeout for this one
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	
+
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/rpc", strings.NewReader(`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"listen_role","arguments":{"role":"coder","mode":"poll"}},"id":"2"}`))
 	r.Header.Set("X-Project-Id", "   ")
 	r = r.WithContext(ctx)
 	handler.ServeHTTP(w, r)
-	
+
 	var res2 Response
 	json.Unmarshal(w.Body.Bytes(), &res2)
 	if res2.Error != nil {
@@ -182,8 +182,8 @@ func TestProjectTenancy_DiskLayout(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-disk-*")
 	defer os.RemoveAll(tmpDir)
 
-	broker, _ := NewBroker(tmpDir, true, true)
-	
+	broker, _ := NewBroker(tmpDir, "", true, true)
+
 	proj := "my-project"
 	taskID, _ := broker.CreateTask(proj, "coder", "Title", "MD")
 

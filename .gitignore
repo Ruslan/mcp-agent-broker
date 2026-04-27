@@ -10,3 +10,6 @@ task-data/
 task-data*/
 
 .gemini/*.log
+
+coverage.out
+coverage.html

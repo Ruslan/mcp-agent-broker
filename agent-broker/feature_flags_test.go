@@ -2,16 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
-	"os"
 )
 
 func TestFeatureFlags_SyncOnly(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-flags-sync-*")
 	defer os.RemoveAll(tmpDir)
 
-	broker, _ := NewBroker(tmpDir, true, false)
+	broker, _ := NewBroker(tmpDir, "", true, false)
 	handler := &JSONRPCHandler{broker: broker}
 
 	// 1. Check tools/list - await_task should be there, listen_role should have only "wait"
@@ -21,7 +21,7 @@ func TestFeatureFlags_SyncOnly(t *testing.T) {
 		ID:      json.RawMessage(`"1"`),
 	}
 	res := callHandler(handler, req, "default")
-	
+
 	tools := res.Result.(map[string]any)["tools"].([]any)
 	hasAwait := false
 	modes := []any{}
@@ -34,7 +34,7 @@ func TestFeatureFlags_SyncOnly(t *testing.T) {
 			modes = t.(map[string]any)["inputSchema"].(map[string]any)["properties"].(map[string]any)["mode"].(map[string]any)["enum"].([]any)
 		}
 	}
-	
+
 	if !hasAwait {
 		t.Error("Expected await_task tool to be present")
 	}
@@ -59,7 +59,7 @@ func TestFeatureFlags_AsyncOnly(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-flags-async-*")
 	defer os.RemoveAll(tmpDir)
 
-	broker, _ := NewBroker(tmpDir, false, true)
+	broker, _ := NewBroker(tmpDir, "", false, true)
 	handler := &JSONRPCHandler{broker: broker}
 
 	// 1. Check tools/list - await_task should be missing, listen_role should have only "poll"
@@ -69,7 +69,7 @@ func TestFeatureFlags_AsyncOnly(t *testing.T) {
 		ID:      json.RawMessage(`"1"`),
 	}
 	res := callHandler(handler, req, "default")
-	
+
 	tools := res.Result.(map[string]any)["tools"].([]any)
 	hasAwait := false
 	modes := []any{}
@@ -82,7 +82,7 @@ func TestFeatureFlags_AsyncOnly(t *testing.T) {
 			modes = t.(map[string]any)["inputSchema"].(map[string]any)["properties"].(map[string]any)["mode"].(map[string]any)["enum"].([]any)
 		}
 	}
-	
+
 	if hasAwait {
 		t.Error("Did not expect await_task tool")
 	}

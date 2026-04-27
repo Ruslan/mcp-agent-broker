@@ -18,7 +18,7 @@ func TestBroker_Lifecycle(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	broker, err := NewBroker(tmpDir, true, true)
+	broker, err := NewBroker(tmpDir, "", true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,13 +65,13 @@ func TestBroker_Lifecycle(t *testing.T) {
 func TestBroker_LifecycleStatus(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-status-*")
 	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, true, true)
+	broker, _ := NewBroker(tmpDir, "", true, true)
 
 	role := "coder"
-	
+
 	// Create task without listener -> should stay queued
 	taskID, _ := broker.CreateTask(testProject, role, "Queued Task", "MD")
-	
+
 	meta, _ := broker.GetTaskStatus(testProject, taskID)
 	if meta.Status != StatusQueued {
 		t.Errorf("Expected status queued when no listener, got %v", meta.Status)
@@ -92,15 +92,15 @@ func TestBroker_LifecycleStatus(t *testing.T) {
 func TestBroker_CreateTask_StatusConsistency(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-consist-*")
 	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, true, true)
+	broker, _ := NewBroker(tmpDir, "", true, true)
 
 	role := "coder"
-	
+
 	// 1. Occupy the listener
 	// ListenRole registers a listener and blocks.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	
+
 	go func() {
 		broker.ListenRole(ctx, testProject, role, "wait", 5000)
 	}()
@@ -108,7 +108,7 @@ func TestBroker_CreateTask_StatusConsistency(t *testing.T) {
 
 	// 2. Deliver first task (fills buffer of size 1)
 	task1ID, _ := broker.CreateTask(testProject, role, "Task 1", "MD")
-	
+
 	meta1, _ := broker.GetTaskStatus(testProject, task1ID)
 	if meta1.Status != StatusPicked {
 		t.Errorf("Expected task 1 to be picked, got %v", meta1.Status)
@@ -127,10 +127,10 @@ func TestBroker_CreateTask_StatusConsistency(t *testing.T) {
 func TestBroker_CreateTask_StatusFailure(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-stat-fail-*")
 	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, true, true)
+	broker, _ := NewBroker(tmpDir, "", true, true)
 
 	role := "coder"
-	
+
 	// Start listener
 	go func() {
 		broker.ListenRole(context.Background(), testProject, role, "wait", 1000)
@@ -154,7 +154,7 @@ func TestBroker_CreateTask_StatusFailure(t *testing.T) {
 func TestBroker_WaitDelivery(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-wait-*")
 	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, true, true)
+	broker, _ := NewBroker(tmpDir, "", true, true)
 
 	role := "coder"
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -191,7 +191,7 @@ func TestBroker_WaitDelivery(t *testing.T) {
 func TestBroker_PollEmpty(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-poll-*")
 	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, true, true)
+	broker, _ := NewBroker(tmpDir, "", true, true)
 
 	task, status, err := broker.ListenRole(context.Background(), testProject, "coder", "poll", 0)
 	if err != nil || task != nil || status != "empty" {
@@ -214,10 +214,10 @@ func TestBroker_PathSafety(t *testing.T) {
 func TestBroker_DuplicateSolve(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-solve-test-*")
 	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, true, true)
+	broker, _ := NewBroker(tmpDir, "", true, true)
 
 	taskID, _ := broker.CreateTask(testProject, "role", "Title", "MD")
-	
+
 	broker.ListenRole(context.Background(), testProject, "role", "poll", 0)
 	err := broker.SolveTask(testProject, taskID, "Result 1")
 	if err != nil {
@@ -233,7 +233,7 @@ func TestBroker_DuplicateSolve(t *testing.T) {
 func TestBroker_TitleValidation(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-title-test-*")
 	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, true, true)
+	broker, _ := NewBroker(tmpDir, "", true, true)
 
 	longTitle := strings.Repeat("a", 201)
 	_, err := broker.CreateTask(testProject, "role", longTitle, "MD")
@@ -250,7 +250,7 @@ func TestBroker_TitleValidation(t *testing.T) {
 func TestBroker_ListTasks(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-list-*")
 	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, true, true)
+	broker, _ := NewBroker(tmpDir, "", true, true)
 
 	broker.CreateTask(testProject, "coder", "Task 1", "MD")
 	broker.CreateTask(testProject, "reviewer", "Task 2", "MD")

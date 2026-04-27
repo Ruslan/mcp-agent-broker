@@ -71,6 +71,11 @@ func main() {
 		dataDir = "data"
 	}
 
+	promptsDir := os.Getenv("PROMPTS_DIR")
+	if promptsDir == "" {
+		promptsDir = "prompts"
+	}
+
 	enableSync := getEnvBool("ENABLE_SYNC", true)
 	enableAsync := getEnvBool("ENABLE_ASYNC", true)
 	apiKey := os.Getenv("API_KEY")
@@ -79,7 +84,7 @@ func main() {
 		log.Fatalf("Fatal: %v", err)
 	}
 
-	broker, err := NewBroker(dataDir, enableSync, enableAsync)
+	broker, err := NewBroker(dataDir, promptsDir, enableSync, enableAsync)
 	if err != nil {
 		log.Fatalf("Failed to initialize broker: %v", err)
 	}

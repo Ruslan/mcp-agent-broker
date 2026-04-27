@@ -132,13 +132,53 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "initialize":
 		result = map[string]any{
 			"protocolVersion": ProtocolVersion,
-			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "agent-broker", "version": ServerVersion},
+			"capabilities": map[string]any{
+				"tools":   map[string]any{},
+				"prompts": map[string]any{},
+			},
+			"serverInfo": map[string]any{"name": "agent-broker", "version": ServerVersion},
+		}
+
+	case "prompts/list":
+		prompts, err := h.broker.ListPrompts()
+		if err != nil {
+			rpcErr = &RPCError{Code: ErrApp, Message: err.Error()}
+		} else {
+			result = map[string]any{
+				"prompts": prompts,
+			}
+		}
+
+	case "prompts/get":
+		var p struct {
+			Name      string            `json:"name"`
+			Arguments map[string]string `json:"arguments"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil || p.Name == "" {
+			rpcErr = &RPCError{Code: ErrInvalidParams, Message: "Invalid params: name is required"}
+		} else {
+			prompt, content, err := h.broker.GetPrompt(p.Name, p.Arguments)
+			if err != nil {
+				rpcErr = &RPCError{Code: ErrApp, Message: err.Error()}
+			} else {
+				result = map[string]any{
+					"description": prompt.Description,
+					"messages": []any{
+						map[string]any{
+							"role": "user",
+							"content": map[string]any{
+								"type": "text",
+								"text": content,
+							},
+						},
+					},
+				}
+			}
 		}
 
 	case "tools/list":
 		var tools []any
-		
+
 		// create_task is always available
 		tools = append(tools, map[string]any{
 			"name":        "create_task",
@@ -319,7 +359,7 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 		if err := json.Unmarshal(args, &p); err != nil || p.Role == "" || p.Mode == "" {
 			return nil, fmt.Errorf("invalid arguments: role and mode are required")
 		}
-		
+
 		if p.Mode == "wait" && !h.broker.EnableSync {
 			return nil, fmt.Errorf("mode \"wait\" is disabled by server configuration (ENABLE_SYNC=false)")
 		}
@@ -331,14 +371,14 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 		if err != nil {
 			return nil, err
 		}
-		
+
 		if task == nil {
 			return map[string]any{
 				"task":   nil,
 				"status": status, // "empty" or "timeout"
 			}, nil
 		}
-		
+
 		return map[string]any{
 			"task": map[string]any{
 				"task_id": task.ID,
@@ -353,7 +393,7 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 			Status string `json:"status"`
 		}
 		json.Unmarshal(args, &p) // ignoring error as all fields are optional
-		
+
 		tasks, err := h.broker.ListTasks(projectID, p.Role, p.Status)
 		if err != nil {
 			return nil, err
@@ -374,17 +414,17 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 		if err := json.Unmarshal(args, &p); err != nil || p.TaskID == "" {
 			return nil, fmt.Errorf("invalid arguments: task_id is required")
 		}
-		
+
 		meta, err := h.broker.GetTaskStatus(projectID, p.TaskID)
 		if err != nil {
 			return nil, err
 		}
-		
+
 		resp := map[string]any{
 			"task_id": meta.TaskID,
 			"status":  meta.Status,
 		}
-		
+
 		needsTaskMD := p.IncludeTaskMD || (meta.Status != StatusSolved && !p.IncludeTaskMD && !p.IncludeResultMD)
 		needsResultMD := p.IncludeResultMD || (meta.Status == StatusSolved && !p.IncludeTaskMD && !p.IncludeResultMD)
 
@@ -394,14 +434,14 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 				resp["task_md"] = md
 			}
 		}
-		
+
 		if needsResultMD && meta.Status == StatusSolved {
 			res, err := h.broker.GetTaskResult(projectID, p.TaskID)
 			if err == nil {
 				resp["result_md"] = res
 			}
 		}
-		
+
 		return resp, nil
 
 	case "solve_task":

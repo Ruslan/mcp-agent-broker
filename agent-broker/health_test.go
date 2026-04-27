@@ -12,7 +12,7 @@ func TestHealthEndpoint(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "broker-health-*")
 	defer os.RemoveAll(tmpDir)
 
-	broker, _ := NewBroker(tmpDir, true, true)
+	broker, _ := NewBroker(tmpDir, "", true, true)
 	handler := &JSONRPCHandler{broker: broker}
 
 	// 1. Valid GET
