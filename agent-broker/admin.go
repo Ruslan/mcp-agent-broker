@@ -28,6 +28,14 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.listTasks(w, r)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/admin/api/prompts/") {
+		h.getPrompt(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/api/prompts") {
+		h.listPrompts(w, r)
+		return
+	}
 	if r.URL.Path == "/admin/events" {
 		h.eventsHandler(w, r)
 		return
@@ -104,6 +112,35 @@ func (h *AdminHandler) deleteTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *AdminHandler) listPrompts(w http.ResponseWriter, r *http.Request) {
+	prompts, err := h.broker.ListPrompts()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(prompts)
+}
+
+func (h *AdminHandler) getPrompt(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimSuffix(r.URL.Path, "/"), "/")
+	name := parts[len(parts)-1]
+
+	meta, body, err := h.broker.GetPrompt(name, nil) // passing nil arguments just gets the raw template body usually
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	resp := map[string]any{
+		"metadata": meta,
+		"body":     body,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (h *AdminHandler) eventsHandler(w http.ResponseWriter, r *http.Request) {

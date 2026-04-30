@@ -202,3 +202,39 @@ footer {
 .progress-entry:last-child {
   border-bottom: none;
 }
+
+.meta-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 1.5rem;
+  font-size: 0.9rem;
+}
+
+.meta-table th, .meta-table td {
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.meta-table th {
+  background: rgba(255, 255, 255, 0.05);
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.view-tabs {
+  display: flex;
+  gap: 1rem;
+  margin-right: 2rem;
+}
+
+.view-tabs button {
+  padding: 0.5rem 1rem;
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.view-tabs button.active {
+  background: var(--primary);
+  border-color: var(--primary);
+}
