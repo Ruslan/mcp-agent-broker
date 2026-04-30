@@ -30,6 +30,7 @@ type Store interface {
 	GetTaskMD(projectID, taskID string) (string, error)
 	GetResult(projectID, taskID string) (string, error)
 	ListTasks(projectID, role, status string) ([]StatusMetadata, error)
+	ListProjects() ([]string, error)
 
 	Close() error
 }
@@ -225,11 +226,35 @@ func (s *SQLiteStore) ListTasks(projectID, role, status string) ([]StatusMetadat
 		m.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 		tasks = append(tasks, m)
 	}
+	if tasks == nil {
+		tasks = []StatusMetadata{}
+	}
 	return tasks, rows.Err()
 }
 
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()
+}
+
+func (s *SQLiteStore) ListProjects() ([]string, error) {
+	rows, err := s.db.Query("SELECT DISTINCT project_id FROM tasks ORDER BY project_id ASC")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list projects: %w", err)
+	}
+	defer rows.Close()
+
+	var projects []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("failed to scan project row: %w", err)
+		}
+		projects = append(projects, p)
+	}
+	if projects == nil {
+		projects = []string{}
+	}
+	return projects, rows.Err()
 }
 
 func isUniqueViolation(err error) bool {

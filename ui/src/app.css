@@ -1,0 +1,43 @@
+@import "@picocss/pico";
+
+:root {
+  --primary: #3d5afe;
+}
+
+body {
+  padding: 2rem;
+}
+
+.status-queued { color: #757575; }
+.status-picked { color: #fbc02d; font-weight: bold; }
+.status-solved { color: #43a047; }
+
+pre {
+  background: #f5f5f5;
+  padding: 1rem;
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+.grid-tasks {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1fr 1.5fr;
+  gap: 1rem;
+  align-items: center;
+  border-bottom: 1px solid #eee;
+  padding: 0.5rem 0;
+}
+
+.header {
+  font-weight: bold;
+  background: #fafafa;
+}
+
+.task-row:hover {
+  background: #f0f4ff;
+  cursor: pointer;
+}
+
+.modal-content {
+  max-width: 800px;
+}

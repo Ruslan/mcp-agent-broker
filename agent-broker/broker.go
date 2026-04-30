@@ -68,8 +68,19 @@ type Broker struct {
 	EnableSync  bool
 	EnableAsync bool
 
+	adminSubs   map[chan statusEvent]struct{}
+	adminSubsMu sync.Mutex
+
 	// Hook for testing: override task ID generation.
 	generateID func() string
+}
+
+// statusEvent is sent to admin subscribers.
+type statusEvent struct {
+	ProjectID string     `json:"project_id"`
+	TaskID    string     `json:"task_id"`
+	Status    TaskStatus `json:"status"`
+	UpdatedAt time.Time  `json:"updated_at"`
 }
 
 // NewBroker initializes and returns a new Broker with the given store.
@@ -92,6 +103,7 @@ func NewBroker(store Store, promptsDir string, enableSync, enableAsync bool) (*B
 		promptsDir:  promptsDir,
 		EnableSync:  enableSync,
 		EnableAsync: enableAsync,
+		adminSubs:   make(map[chan statusEvent]struct{}),
 	}
 	b.generateID = generateTaskID
 	return b, nil
@@ -175,6 +187,12 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 
 			select {
 			case ch <- task:
+				b.publishAdminEvent(statusEvent{
+					ProjectID: projectID,
+					TaskID:    taskID,
+					Status:    StatusPicked,
+					UpdatedAt: time.Now().UTC(),
+				})
 				return taskID, nil
 			default:
 				// Listener was busy/disappeared, rollback to queued
@@ -189,6 +207,13 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 		b.asyncQueue[projectID] = make(map[string][]*Task)
 	}
 	b.asyncQueue[projectID][role] = append(b.asyncQueue[projectID][role], task)
+
+	b.publishAdminEvent(statusEvent{
+		ProjectID: projectID,
+		TaskID:    taskID,
+		Status:    StatusQueued,
+		UpdatedAt: time.Now().UTC(),
+	})
 
 	return taskID, nil
 }
@@ -321,6 +346,12 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 				b.mu.Unlock()
 				return nil, "", fmt.Errorf("failed to update status to picked: %w", err)
 			}
+			b.publishAdminEvent(statusEvent{
+				ProjectID: projectID,
+				TaskID:    task.ID,
+				Status:    StatusPicked,
+				UpdatedAt: time.Now().UTC(),
+			})
 
 			projectQueue[role] = queue[1:]
 			b.mu.Unlock()
@@ -403,6 +434,13 @@ func (b *Broker) SolveTask(projectID, taskID, resultMD string) error {
 	close(task.progress)
 	b.mu.Unlock()
 
+	b.publishAdminEvent(statusEvent{
+		ProjectID: projectID,
+		TaskID:    taskID,
+		Status:    StatusSolved,
+		UpdatedAt: time.Now().UTC(),
+	})
+
 	select {
 	case task.done <- resultMD:
 	default:
@@ -437,6 +475,11 @@ func (b *Broker) GetTaskMD(projectID, taskID string) (string, error) {
 // ListTasks returns task metadata filtered by optional role and status.
 func (b *Broker) ListTasks(projectID, role, status string) ([]StatusMetadata, error) {
 	return b.store.ListTasks(projectID, role, status)
+}
+
+// ListProjects returns a list of distinct project IDs.
+func (b *Broker) ListProjects() ([]string, error) {
+	return b.store.ListProjects()
 }
 
 // PromptMetadata represents basic information about a prompt.
@@ -603,4 +646,32 @@ func renderPromptTemplate(body string, arguments map[string]string) string {
 		body = strings.ReplaceAll(body, placeholder, value)
 	}
 	return body
+}
+
+// Subscribe returns a channel that receives all task status events.
+func (b *Broker) Subscribe() chan statusEvent {
+	ch := make(chan statusEvent, 32)
+	b.adminSubsMu.Lock()
+	b.adminSubs[ch] = struct{}{}
+	b.adminSubsMu.Unlock()
+	return ch
+}
+
+// Unsubscribe removes a channel from the admin subscription list.
+func (b *Broker) Unsubscribe(ch chan statusEvent) {
+	b.adminSubsMu.Lock()
+	delete(b.adminSubs, ch)
+	b.adminSubsMu.Unlock()
+}
+
+func (b *Broker) publishAdminEvent(e statusEvent) {
+	b.adminSubsMu.Lock()
+	defer b.adminSubsMu.Unlock()
+	for ch := range b.adminSubs {
+		select {
+		case ch <- e:
+		default:
+			// Client slow or disconnected, drop event
+		}
+	}
 }

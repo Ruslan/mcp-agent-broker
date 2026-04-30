@@ -16,6 +16,7 @@ The current API is based on a small task lifecycle:
 ```text
 .
 ├── agent-broker/               # Go server
+├── ui/                         # Svelte 5 admin dashboard (sources)
 ├── data/                       # Runtime data directory
 ├── docs/dev/                   # Version plans and design notes
 ├── examples/ralph-simple/      # Example role prompts
@@ -23,19 +24,27 @@ The current API is based on a small task lifecycle:
 └── README.md
 ```
 
+## Prerequisites
+
+- **Go** 1.22+
+- **Node.js** 18+ and **npm** (for building the admin UI)
+- **Make** (optional, for convenience targets)
+
 ## Core Concepts
 
 1. Tenancy: use `X-Project-Id` to isolate tasks between projects
 2. Roles: tasks are assigned to roles such as `coder`
 3. Lifecycle: create a task, optionally wait for it, let a worker pick it up, then solve it
 
-## Run
+## Build & Run
 
-Build from the repository root:
+Build from the repository root (builds the admin UI, then compiles the Go binary):
 
 ```bash
 make build
 ```
+
+This runs `npm ci && npm run build` in `ui/`, copies the compiled assets to `agent-broker/dist/`, then builds the Go binary with embedded static files.
 
 Run with defaults:
 
@@ -43,7 +52,7 @@ Run with defaults:
 make run
 ```
 
-Direct Go run is also fine:
+Direct Go run (requires `agent-broker/dist/` to exist from a prior `make ui-build`):
 
 ```bash
 cd agent-broker
@@ -53,21 +62,38 @@ go run .
 Default server settings:
 
 1. port: `9197`
-2. data dir: `data`
+2. database: `data/broker.db`
 3. sync enabled: `true`
 4. async enabled: `true`
 
-MCP endpoint:
+## Endpoints
+
+MCP / JSON-RPC:
 
 ```text
 http://localhost:9197/rpc
 ```
 
-Health endpoint:
+Health check:
 
 ```text
 http://localhost:9197/health
 ```
+
+Admin UI (browser):
+
+```text
+http://localhost:9197/admin/
+```
+
+Admin REST API:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/admin/api/projects` | List distinct project IDs |
+| `GET` | `/admin/api/tasks` | List tasks; query params: `project`, `role`, `status` |
+| `GET` | `/admin/api/tasks/:id` | Task detail: metadata + task_md + result_md |
+| `GET` | `/admin/events` | SSE stream: live task status updates |
 
 ## Environment
 
@@ -76,10 +102,11 @@ The server automatically loads environment variables from a `.env` file in the c
 Supported environment variables:
 
 1. `PORT`: server port, default `9197`
-2. `DATA_DIR`: persistence root, default `data`
-3. `API_KEY`: optional API key for authentication. If set, clients must use `Authorization: Bearer <key>` header.
-4. `ENABLE_SYNC`: enables `await_task` and `listen_role(mode="wait")`, default `true`
-5. `ENABLE_ASYNC`: enables `listen_role(mode="poll")`, default `true`
+2. `DB_PATH`: SQLite database path, default `data/broker.db`
+3. `PROMPTS_DIR`: prompt templates directory, default `prompts`
+4. `API_KEY`: optional API key for authentication. If set, clients must use `Authorization: Bearer <key>` header.
+5. `ENABLE_SYNC`: enables `await_task` and `listen_role(mode="wait")`, default `true`
+6. `ENABLE_ASYNC`: enables `listen_role(mode="poll")`, default `true`
 
 At least one of `ENABLE_SYNC` or `ENABLE_ASYNC` must stay enabled.
 
@@ -309,23 +336,48 @@ See `examples/ralph-simple/` for example prompts for:
 
 ## Development
 
-Build:
+### Prerequisites
+
+- Go 1.22+
+- Node.js 18+ / npm
+
+### Build
 
 ```bash
 make build
 ```
 
-Test:
+This builds the UI first (`make ui-build`), then compiles the Go binary.
+
+To rebuild only the UI:
+
+```bash
+make ui-build
+```
+
+### Test
 
 ```bash
 cd agent-broker
 go test -count=1 ./...
 ```
 
-Extra checks:
+### Extra checks
 
 ```bash
 cd agent-broker
 go build ./...
 go vet ./...
 ```
+
+### UI development
+
+For local UI development with hot reload:
+
+```bash
+cd ui
+npm ci
+npm run dev
+```
+
+The Vite dev server proxies are not configured — this is for iterating on the UI only. For a full integration test, use `make build && make run`.

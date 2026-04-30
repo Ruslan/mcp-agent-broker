@@ -2,6 +2,7 @@ broker
 agent-broker/agent-broker
 agent-broker/agent-broker-bin
 agent-broker/*.orig
+agent-broker/dist/
 
 data/*
 !data/.keep

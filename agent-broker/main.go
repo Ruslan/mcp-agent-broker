@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -68,7 +69,7 @@ func main() {
 
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
-		dbPath = "broker.db"
+		dbPath = "data/broker.db"
 	}
 
 	promptsDir := os.Getenv("PROMPTS_DIR")
@@ -84,6 +85,10 @@ func main() {
 		log.Fatalf("Fatal: %v", err)
 	}
 
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		log.Fatalf("Failed to create data directory: %v", err)
+	}
+
 	store, err := NewSQLiteStore(dbPath)
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
@@ -96,10 +101,18 @@ func main() {
 	}
 
 	handler := &JSONRPCHandler{broker: broker}
+	adminHandler := &AdminHandler{broker: broker}
 
 	mux := http.NewServeMux()
 	mux.Handle("/rpc", handler)
 	mux.HandleFunc("/health", handler.HealthHandler)
+
+	// Admin API
+	mux.Handle("/admin/api/", adminHandler)
+	mux.Handle("/admin/events", adminHandler)
+
+	// Admin UI (SPA)
+	mux.Handle("/admin/", http.StripPrefix("/admin", http.FileServer(http.FS(adminFS))))
 
 	wrappedMux := AuthMiddleware(apiKey, mux)
 
