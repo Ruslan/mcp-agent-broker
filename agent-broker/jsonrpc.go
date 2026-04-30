@@ -273,6 +273,18 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					"required": []string{"task_id", "result_md"},
 				},
 			},
+			map[string]any{
+				"name":        "progress_task",
+				"description": "Send an intermediate progress update for a task without completing it. Call multiple times during long-running work.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"task_id": map[string]any{"type": "string"},
+						"message": map[string]any{"type": "string", "description": "Short human-readable status update (max 500 chars)"},
+					},
+					"required": []string{"task_id", "message"},
+				},
+			},
 		)
 
 		result = map[string]any{
@@ -340,7 +352,7 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 		if err := json.Unmarshal(args, &p); err != nil || p.TaskID == "" {
 			return nil, fmt.Errorf("invalid arguments: task_id is required")
 		}
-		status, res, err := h.broker.AwaitTask(ctx, projectID, p.TaskID, p.TimeoutMs)
+		status, res, progress, err := h.broker.AwaitTask(ctx, projectID, p.TaskID, p.TimeoutMs)
 		if err != nil {
 			return nil, err
 		}
@@ -350,6 +362,9 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 		}
 		if status == string(StatusSolved) {
 			resp["result_md"] = res
+		}
+		if len(progress) > 0 {
+			resp["progress"] = progress
 		}
 		return resp, nil
 
@@ -456,6 +471,22 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 			return nil, fmt.Errorf("invalid arguments: task_id and result_md are required")
 		}
 		if err := h.broker.SolveTask(projectID, p.TaskID, p.ResultMD); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, nil
+
+	case "progress_task":
+		var p struct {
+			TaskID  string `json:"task_id"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil || p.TaskID == "" || p.Message == "" {
+			return nil, fmt.Errorf("invalid arguments: task_id and message are required")
+		}
+		if len(p.Message) > 500 {
+			return nil, fmt.Errorf("message too long (max 500 chars)")
+		}
+		if err := h.broker.ReportProgress(projectID, p.TaskID, p.Message); err != nil {
 			return nil, err
 		}
 		return map[string]bool{"ok": true}, nil

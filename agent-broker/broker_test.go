@@ -44,7 +44,7 @@ func TestBroker_Lifecycle(t *testing.T) {
 	}
 
 	// 3. Await Task (Not solved, should timeout)
-	status, res, err := broker.AwaitTask(context.Background(), testProject, taskID, 50)
+	status, res, _, err := broker.AwaitTask(context.Background(), testProject, taskID, 50)
 	if err != nil || status != string(StatusPicked) || res != "" {
 		t.Errorf("AwaitTask unexpected: status=%v, res=%v, err=%v", status, res, err)
 	}
@@ -56,7 +56,7 @@ func TestBroker_Lifecycle(t *testing.T) {
 	}
 
 	// 5. Await Task (Solved)
-	status, res, err = broker.AwaitTask(context.Background(), testProject, taskID, 50)
+	status, res, _, err = broker.AwaitTask(context.Background(), testProject, taskID, 50)
 	if err != nil || status != string(StatusSolved) || res != resultMD {
 		t.Errorf("AwaitTask(solved) unexpected: status=%v, res=%v, err=%v", status, res, err)
 	}

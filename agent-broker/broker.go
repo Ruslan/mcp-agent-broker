@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -50,6 +51,7 @@ type Task struct {
 	Title     string
 	MD        string
 	done      chan string // buffered size 1
+	progress  chan string // buffered size 32, closed by SolveTask
 }
 
 // Broker manages the coordination between task creators and role listeners.
@@ -230,6 +232,7 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 		Title:     title,
 		MD:        taskMD,
 		done:      make(chan string, 1),
+		progress:  make(chan string, 32),
 	}
 	if b.tasks[projectID] == nil {
 		b.tasks[projectID] = make(map[string]*Task)
@@ -265,24 +268,48 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 	return taskID, nil
 }
 
+// ReportProgress sends an intermediate progress message for an in-flight task.
+// Non-blocking: if the progress buffer (32) is full, the message is dropped with a log warning.
+func (b *Broker) ReportProgress(projectID, taskID, message string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	projectTasks, ok := b.tasks[projectID]
+	if !ok {
+		return fmt.Errorf("task %q not found in project %q", taskID, projectID)
+	}
+	task, exists := projectTasks[taskID]
+	if !exists {
+		return fmt.Errorf("task %q not found in project %q", taskID, projectID)
+	}
+
+	select {
+	case task.progress <- message:
+	default:
+		log.Printf("progress buffer full for task %s, dropping message", taskID)
+	}
+	return nil
+}
+
 // AwaitTask blocks until the task reaches a terminal state or timeout/cancel.
-func (b *Broker) AwaitTask(ctx context.Context, projectID, taskID string, timeoutMs int) (string, string, error) {
+// Returns status, result, collected progress messages, and error.
+func (b *Broker) AwaitTask(ctx context.Context, projectID, taskID string, timeoutMs int) (string, string, []string, error) {
 	if taskID == "" {
-		return "", "", fmt.Errorf("task_id is required")
+		return "", "", nil, fmt.Errorf("task_id is required")
 	}
 	if !isSafeID(taskID) {
-		return "", "", fmt.Errorf("invalid task_id")
+		return "", "", nil, fmt.Errorf("invalid task_id")
 	}
 
 	// First check disk to see if it's already solved
 	meta, err := b.GetTaskStatus(projectID, taskID)
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	if meta.Status == StatusSolved {
 		res, err := b.GetTaskResult(projectID, taskID)
 		if err == nil {
-			return string(meta.Status), res, nil
+			return string(meta.Status), res, nil, nil
 		}
 	}
 
@@ -290,7 +317,7 @@ func (b *Broker) AwaitTask(ctx context.Context, projectID, taskID string, timeou
 	projectTasks, ok := b.tasks[projectID]
 	if !ok {
 		b.mu.Unlock()
-		return string(meta.Status), "", nil
+		return string(meta.Status), "", nil, nil
 	}
 	task, exists := projectTasks[taskID]
 	b.mu.Unlock()
@@ -298,13 +325,13 @@ func (b *Broker) AwaitTask(ctx context.Context, projectID, taskID string, timeou
 	if !exists {
 		meta, err = b.GetTaskStatus(projectID, taskID)
 		if err != nil {
-			return "", "", err
+			return "", "", nil, err
 		}
 		if meta.Status == StatusSolved {
 			res, err := b.GetTaskResult(projectID, taskID)
-			return string(meta.Status), res, err
+			return string(meta.Status), res, nil, err
 		}
-		return string(meta.Status), "", nil
+		return string(meta.Status), "", nil, nil
 	}
 
 	var timeoutCh <-chan time.Time
@@ -319,19 +346,34 @@ func (b *Broker) AwaitTask(ctx context.Context, projectID, taskID string, timeou
 		case task.done <- res:
 		default:
 		}
-		return string(StatusSolved), res, nil
+		// Drain progress messages (progress channel is closed by SolveTask before signaling done)
+		var progress []string
+		for msg := range task.progress {
+			progress = append(progress, msg)
+		}
+		return string(StatusSolved), res, progress, nil
 	case <-ctx.Done():
 		meta, _ = b.GetTaskStatus(projectID, taskID)
 		if meta != nil {
-			return string(meta.Status), "", ctx.Err()
+			return string(meta.Status), "", nil, ctx.Err()
 		}
-		return "", "", ctx.Err()
+		return "", "", nil, ctx.Err()
 	case <-timeoutCh:
 		meta, _ = b.GetTaskStatus(projectID, taskID)
-		if meta != nil {
-			return string(meta.Status), "", nil
+		var progress []string
+		for {
+			select {
+			case msg := <-task.progress:
+				progress = append(progress, msg)
+			default:
+				goto doneTimeout
+			}
 		}
-		return "", "", fmt.Errorf("task %q not found after timeout", taskID)
+	doneTimeout:
+		if meta != nil {
+			return string(meta.Status), "", progress, nil
+		}
+		return "", "", progress, fmt.Errorf("task %q not found after timeout", taskID)
 	}
 }
 
@@ -437,6 +479,7 @@ func (b *Broker) SolveTask(projectID, taskID, resultMD string) error {
 	if len(projectTasks) == 0 {
 		delete(b.tasks, projectID)
 	}
+	close(task.progress)
 	b.mu.Unlock()
 
 	select {
