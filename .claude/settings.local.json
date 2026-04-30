@@ -7,7 +7,10 @@
       "mcp__agent-broker-test__listen_role_async",
       "Bash(go test:*)",
       "mcp__agent-broker-test__solve_task",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(grep:*)",
+      "Bash(go get:*)",
+      "Bash(go build:*)"
     ]
   }
 }

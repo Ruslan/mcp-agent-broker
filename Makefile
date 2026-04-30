@@ -4,7 +4,7 @@
 BINARY_NAME=broker
 SOURCE_DIR=agent-broker
 PORT=9197
-DATA_DIR=data
+DB_PATH=broker.db
 
 build:
 	@echo "Building $(BINARY_NAME)..."
@@ -12,7 +12,7 @@ build:
 
 run: build
 	@echo "Starting Agent Task Broker on port $(PORT)..."
-	PORT=$(PORT) DATA_DIR=$(DATA_DIR) ./$(BINARY_NAME)
+	PORT=$(PORT) DB_PATH=$(DB_PATH) ./$(BINARY_NAME)
 
 test: build
 	@echo "Running Go tests..."

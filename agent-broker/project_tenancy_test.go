@@ -4,17 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
 )
 
 func TestProjectTenancy_Isolation(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-tenancy-*")
-	defer os.RemoveAll(tmpDir)
-
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 	handler := &JSONRPCHandler{broker: broker}
 
 	projA := "project-a"
@@ -129,10 +125,7 @@ func TestProjectTenancy_Isolation(t *testing.T) {
 }
 
 func TestProjectTenancy_InvalidProjectID(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-invalid-proj-*")
-	defer os.RemoveAll(tmpDir)
-
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 	handler := &JSONRPCHandler{broker: broker}
 
 	req := Request{
@@ -179,19 +172,17 @@ func TestProjectTenancy_InvalidProjectID(t *testing.T) {
 }
 
 func TestProjectTenancy_DiskLayout(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-disk-*")
-	defer os.RemoveAll(tmpDir)
-
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 
 	proj := "my-project"
 	taskID, _ := broker.CreateTask(proj, "coder", "Title", "MD")
 
-	// Check if directory exists
-	// Internal check: can't use taskDir helper as it's private, but we know the layout
-	path := tmpDir + "/" + proj + "/" + taskID + "/task.md"
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Errorf("Task file not found at expected path: %s", path)
+	md, err := broker.GetTaskMD(proj, taskID)
+	if err != nil {
+		t.Fatalf("GetTaskMD failed: %v", err)
+	}
+	if md != "MD" {
+		t.Errorf("Expected 'MD', got '%s'", md)
 	}
 }
 

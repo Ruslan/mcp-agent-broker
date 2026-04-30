@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -11,17 +10,22 @@ import (
 
 const testProject = "default"
 
-func TestBroker_Lifecycle(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "broker-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
+// mockStore wraps a real Store and can fail UpdateStatus for a specific status.
+type mockStore struct {
+	Store
+	failStatus TaskStatus
+	failErr    error
+}
 
-	broker, err := NewBroker(tmpDir, "", true, true)
-	if err != nil {
-		t.Fatal(err)
+func (m *mockStore) UpdateStatus(projectID, taskID string, status TaskStatus) error {
+	if status == m.failStatus {
+		return m.failErr
 	}
+	return m.Store.UpdateStatus(projectID, taskID, status)
+}
+
+func TestBroker_Lifecycle(t *testing.T) {
+	broker := newTestBroker(t, true, true)
 
 	role := "coder"
 	title := "Test Title"
@@ -63,9 +67,7 @@ func TestBroker_Lifecycle(t *testing.T) {
 }
 
 func TestBroker_LifecycleStatus(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-status-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 
 	role := "coder"
 
@@ -90,21 +92,17 @@ func TestBroker_LifecycleStatus(t *testing.T) {
 }
 
 func TestBroker_CreateTask_StatusConsistency(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-consist-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 
 	role := "coder"
 
-	// 1. Occupy the listener
-	// ListenRole registers a listener and blocks.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	go func() {
 		broker.ListenRole(ctx, testProject, role, "wait", 5000)
 	}()
-	time.Sleep(100 * time.Millisecond) // Let listener register
+	time.Sleep(100 * time.Millisecond)
 
 	// 2. Deliver first task (fills buffer of size 1)
 	task1ID, _ := broker.CreateTask(testProject, role, "Task 1", "MD")
@@ -125,25 +123,20 @@ func TestBroker_CreateTask_StatusConsistency(t *testing.T) {
 }
 
 func TestBroker_CreateTask_StatusFailure(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-stat-fail-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	inner := newTestStore(t)
+	mock := &mockStore{
+		Store:      inner,
+		failStatus: StatusPicked,
+		failErr:    fmt.Errorf("disk error during pick"),
+	}
+	broker, _ := NewBroker(mock, "", true, true)
 
 	role := "coder"
 
-	// Start listener
 	go func() {
 		broker.ListenRole(context.Background(), testProject, role, "wait", 1000)
 	}()
 	time.Sleep(100 * time.Millisecond)
-
-	// Simulate failure ONLY for StatusPicked
-	broker.persistStatus = func(projectID, taskID, role, title string, status TaskStatus) error {
-		if status == StatusPicked {
-			return fmt.Errorf("disk error during pick")
-		}
-		return broker.defaultPersistStatus(projectID, taskID, role, title, status)
-	}
 
 	_, err := broker.CreateTask(testProject, role, "Failed Task", "MD")
 	if err == nil || !strings.Contains(err.Error(), "disk error during pick") {
@@ -152,15 +145,12 @@ func TestBroker_CreateTask_StatusFailure(t *testing.T) {
 }
 
 func TestBroker_WaitDelivery(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-wait-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 
 	role := "coder"
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// Start listener
 	taskCh := make(chan *Task, 1)
 	go func() {
 		task, _, _ := broker.ListenRole(ctx, testProject, role, "wait", 1000)
@@ -170,7 +160,6 @@ func TestBroker_WaitDelivery(t *testing.T) {
 	}()
 	time.Sleep(100 * time.Millisecond)
 
-	// Create task
 	taskID, _ := broker.CreateTask(testProject, role, "Title", "MD")
 
 	select {
@@ -189,9 +178,7 @@ func TestBroker_WaitDelivery(t *testing.T) {
 }
 
 func TestBroker_PollEmpty(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-poll-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 
 	task, status, err := broker.ListenRole(context.Background(), testProject, "coder", "poll", 0)
 	if err != nil || task != nil || status != "empty" {
@@ -212,9 +199,7 @@ func TestBroker_PathSafety(t *testing.T) {
 }
 
 func TestBroker_DuplicateSolve(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-solve-test-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 
 	taskID, _ := broker.CreateTask(testProject, "role", "Title", "MD")
 
@@ -231,9 +216,7 @@ func TestBroker_DuplicateSolve(t *testing.T) {
 }
 
 func TestBroker_TitleValidation(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-title-test-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 
 	longTitle := strings.Repeat("a", 201)
 	_, err := broker.CreateTask(testProject, "role", longTitle, "MD")
@@ -248,9 +231,7 @@ func TestBroker_TitleValidation(t *testing.T) {
 }
 
 func TestBroker_ListTasks(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-list-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 
 	broker.CreateTask(testProject, "coder", "Task 1", "MD")
 	broker.CreateTask(testProject, "reviewer", "Task 2", "MD")

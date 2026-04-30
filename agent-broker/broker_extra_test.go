@@ -2,22 +2,12 @@ package main
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 )
 
 func TestBroker_GetTaskMD_And_Result(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "broker-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	broker, err := NewBroker(tmpDir, "", true, true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	broker := newTestBroker(t, true, true)
 
 	projectID := "default"
 	taskID, err := broker.CreateTask(projectID, "role1", "title1", "task content")
@@ -49,7 +39,8 @@ func TestBroker_GetTaskMD_And_Result(t *testing.T) {
 		t.Errorf("Expected empty result, got '%s'", res)
 	}
 
-	// Solve task
+	// Solve task (need to pick it first)
+	broker.ListenRole(context.Background(), projectID, "role1", "poll", 0)
 	err = broker.SolveTask(projectID, taskID, "result content")
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +55,7 @@ func TestBroker_GetTaskMD_And_Result(t *testing.T) {
 		t.Errorf("Expected 'result content', got '%s'", res)
 	}
 
-	// Test GetTaskResult invalid task
+	// Test GetTaskResult nonexistent task
 	_, err = broker.GetTaskResult(projectID, "nonexistent")
 	if err == nil {
 		t.Error("Expected error for nonexistent task")
@@ -78,16 +69,7 @@ func TestBroker_GetTaskMD_And_Result(t *testing.T) {
 }
 
 func TestBroker_AwaitTask_Timeout(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "broker-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	broker, err := NewBroker(tmpDir, "", true, true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	broker := newTestBroker(t, true, true)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -120,15 +102,12 @@ func TestBroker_AwaitTask_Timeout(t *testing.T) {
 }
 
 func TestBroker_ReportProgress(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-progress-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 
 	projectID := "default"
 	taskID, _ := broker.CreateTask(projectID, "coder", "Title", "MD")
 	broker.ListenRole(context.Background(), projectID, "coder", "poll", 0)
 
-	// Send progress updates
 	if err := broker.ReportProgress(projectID, taskID, "step 1 done"); err != nil {
 		t.Fatalf("ReportProgress failed: %v", err)
 	}
@@ -136,7 +115,6 @@ func TestBroker_ReportProgress(t *testing.T) {
 		t.Fatalf("ReportProgress failed: %v", err)
 	}
 
-	// Solve and await — progress should be returned
 	go func() {
 		time.Sleep(10 * time.Millisecond)
 		broker.SolveTask(projectID, taskID, "final result")
@@ -158,9 +136,7 @@ func TestBroker_ReportProgress(t *testing.T) {
 }
 
 func TestBroker_ReportProgress_NotFound(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-progress-notfound-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 
 	err := broker.ReportProgress("default", "nonexistent", "hello")
 	if err == nil {
@@ -169,16 +145,13 @@ func TestBroker_ReportProgress_NotFound(t *testing.T) {
 }
 
 func TestBroker_ReportProgress_AfterSolve(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-progress-solved-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 
 	projectID := "default"
 	taskID, _ := broker.CreateTask(projectID, "coder", "Title", "MD")
 	broker.ListenRole(context.Background(), projectID, "coder", "poll", 0)
 	broker.SolveTask(projectID, taskID, "done")
 
-	// Task is removed from memory after solve — progress_task should fail
 	err := broker.ReportProgress(projectID, taskID, "too late")
 	if err == nil {
 		t.Error("Expected error for progress after solve")

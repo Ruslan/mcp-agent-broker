@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -17,6 +17,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// os and path/filepath are still used by the prompts subsystem below.
 
 const (
 	ServerVersion   = "1.0.0"
@@ -60,27 +62,23 @@ type Broker struct {
 	listeners  map[string]map[string]chan *Task // projectID -> role -> chan
 	tasks      map[string]map[string]*Task      // projectID -> taskID -> *Task
 	asyncQueue map[string]map[string][]*Task    // projectID -> role -> []*Task
-	dataDir    string
+	store      Store
 	promptsDir string
 
 	EnableSync  bool
 	EnableAsync bool
 
-	// Hooks for testing
-	generateID    func() string
-	persistStatus func(projectID, taskID, role, title string, status TaskStatus) error
+	// Hook for testing: override task ID generation.
+	generateID func() string
 }
 
-// NewBroker initializes and returns a new Broker with persistence support.
-func NewBroker(dataDir, promptsDir string, enableSync, enableAsync bool) (*Broker, error) {
-	if dataDir == "" {
-		dataDir = "data"
+// NewBroker initializes and returns a new Broker with the given store.
+func NewBroker(store Store, promptsDir string, enableSync, enableAsync bool) (*Broker, error) {
+	if store == nil {
+		return nil, fmt.Errorf("store is required")
 	}
 	if promptsDir == "" {
 		promptsDir = "prompts"
-	}
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 	if err := os.MkdirAll(promptsDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create prompts directory: %w", err)
@@ -90,13 +88,12 @@ func NewBroker(dataDir, promptsDir string, enableSync, enableAsync bool) (*Broke
 		listeners:   make(map[string]map[string]chan *Task),
 		tasks:       make(map[string]map[string]*Task),
 		asyncQueue:  make(map[string]map[string][]*Task),
-		dataDir:     dataDir,
+		store:       store,
 		promptsDir:  promptsDir,
 		EnableSync:  enableSync,
 		EnableAsync: enableAsync,
 	}
 	b.generateID = generateTaskID
-	b.persistStatus = b.defaultPersistStatus
 	return b, nil
 }
 
@@ -123,73 +120,6 @@ func generateTaskID() string {
 	return hex.EncodeToString(b)
 }
 
-func (b *Broker) taskDir(projectID, taskID string) string {
-	return filepath.Join(b.dataDir, projectID, taskID)
-}
-
-func (b *Broker) persistTask(projectID, taskID, taskMD string) error {
-	dir := b.taskDir(projectID, taskID)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create task directory: %w", err)
-	}
-	path := filepath.Join(dir, "task.md")
-
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
-	if err != nil {
-		if os.IsExist(err) {
-			return fmt.Errorf("task file already exists")
-		}
-		return fmt.Errorf("failed to create task.md: %w", err)
-	}
-	defer f.Close()
-
-	if _, err := f.Write([]byte(taskMD)); err != nil {
-		return fmt.Errorf("failed to write task.md: %w", err)
-	}
-	return nil
-}
-
-func (b *Broker) defaultPersistStatus(projectID, taskID, role, title string, status TaskStatus) error {
-	dir := b.taskDir(projectID, taskID)
-	path := filepath.Join(dir, "status.json")
-
-	var meta StatusMetadata
-	now := time.Now().UTC()
-
-	if _, err := os.Stat(path); err == nil {
-		// Update existing
-		data, err := os.ReadFile(path)
-		if err == nil {
-			json.Unmarshal(data, &meta)
-		}
-	} else {
-		// New metadata
-		meta.TaskID = taskID
-		meta.ProjectID = projectID
-		meta.Role = role
-		meta.Title = title
-		meta.CreatedAt = now
-	}
-
-	meta.Status = status
-	meta.UpdatedAt = now
-
-	data, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal status: %w", err)
-	}
-
-	return os.WriteFile(path, data, 0644)
-}
-
-func (b *Broker) persistResult(projectID, taskID, resultMD string) error {
-	dir := b.taskDir(projectID, taskID)
-	path := filepath.Join(dir, "result.md")
-	if err := os.WriteFile(path, []byte(resultMD), 0644); err != nil {
-		return fmt.Errorf("failed to write result.md: %w", err)
-	}
-	return nil
-}
 
 // CreateTask enqueues a task for a role and returns immediately with a generated ID.
 func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, error) {
@@ -205,21 +135,16 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 
 	for i := 0; i < 5; i++ {
 		taskID = b.generateID()
-		err = b.persistTask(projectID, taskID, taskMD)
+		err = b.store.InsertTask(projectID, taskID, role, title, taskMD)
 		if err == nil {
 			break
 		}
-		if !strings.Contains(err.Error(), "already exists") {
+		if !errors.Is(err, ErrTaskExists) {
 			return "", fmt.Errorf("persistence failed: %w", err)
 		}
 	}
 	if err != nil {
 		return "", fmt.Errorf("failed to generate unique task_id after 5 attempts: %w", err)
-	}
-
-	if err := b.persistStatus(projectID, taskID, role, title, StatusQueued); err != nil {
-		os.RemoveAll(b.taskDir(projectID, taskID))
-		return "", fmt.Errorf("failed to persist status: %w", err)
 	}
 
 	b.mu.Lock()
@@ -242,9 +167,9 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 	// If a listener is waiting, deliver directly
 	if projectListeners, ok := b.listeners[projectID]; ok {
 		if ch, hasListener := projectListeners[role]; hasListener {
-			// Mark as picked on disk before attempting delivery
-			if err := b.persistStatus(projectID, taskID, role, title, StatusPicked); err != nil {
-				os.RemoveAll(b.taskDir(projectID, taskID))
+			if err := b.store.UpdateStatus(projectID, taskID, StatusPicked); err != nil {
+				delete(b.tasks[projectID], taskID)
+				b.store.DeleteTask(projectID, taskID)
 				return "", fmt.Errorf("failed to update status to picked: %w", err)
 			}
 
@@ -252,9 +177,9 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 			case ch <- task:
 				return taskID, nil
 			default:
-				// Listener was busy/disappeared, rollback status on disk to queued
-				if err := b.persistStatus(projectID, taskID, role, title, StatusQueued); err != nil {
-					// Log but continue to ensure task is at least in the async queue
+				// Listener was busy/disappeared, rollback to queued
+				if err := b.store.UpdateStatus(projectID, taskID, StatusQueued); err != nil {
+					log.Printf("failed to rollback status for task %s: %v", taskID, err)
 				}
 			}
 		}
@@ -392,7 +317,7 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 		if queue := projectQueue[role]; len(queue) > 0 {
 			task := queue[0]
 
-			if err := b.persistStatus(projectID, task.ID, role, task.Title, StatusPicked); err != nil {
+			if err := b.store.UpdateStatus(projectID, task.ID, StatusPicked); err != nil {
 				b.mu.Unlock()
 				return nil, "", fmt.Errorf("failed to update status to picked: %w", err)
 			}
@@ -466,13 +391,9 @@ func (b *Broker) SolveTask(projectID, taskID, resultMD string) error {
 		return fmt.Errorf("task %q not found in memory for project %q", taskID, projectID)
 	}
 
-	if err := b.persistResult(projectID, taskID, resultMD); err != nil {
+	if err := b.store.SaveResult(projectID, taskID, resultMD); err != nil {
 		b.mu.Unlock()
-		return fmt.Errorf("failed to persist result: %w", err)
-	}
-	if err := b.persistStatus(projectID, taskID, task.Role, task.Title, StatusSolved); err != nil {
-		b.mu.Unlock()
-		return fmt.Errorf("failed to update status to solved: %w", err)
+		return fmt.Errorf("failed to save result: %w", err)
 	}
 
 	delete(projectTasks, taskID)
@@ -489,94 +410,33 @@ func (b *Broker) SolveTask(projectID, taskID, resultMD string) error {
 	return nil
 }
 
-// GetTaskStatus returns the status metadata from disk.
+// GetTaskStatus returns the status metadata for a task.
 func (b *Broker) GetTaskStatus(projectID, taskID string) (*StatusMetadata, error) {
 	if !isSafeID(taskID) {
 		return nil, fmt.Errorf("invalid task_id")
 	}
-	path := filepath.Join(b.taskDir(projectID, taskID), "status.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("task %q not found in project %q", taskID, projectID)
-		}
-		return nil, fmt.Errorf("failed to read status: %w", err)
-	}
-	var meta StatusMetadata
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return nil, fmt.Errorf("failed to parse status: %w", err)
-	}
-	return &meta, nil
+	return b.store.GetStatus(projectID, taskID)
 }
 
-// GetTaskResult returns the result markdown from disk if available.
+// GetTaskResult returns the result for a task if available.
 func (b *Broker) GetTaskResult(projectID, taskID string) (string, error) {
 	if !isSafeID(taskID) {
 		return "", fmt.Errorf("invalid task_id")
 	}
-	path := filepath.Join(b.taskDir(projectID, taskID), "result.md")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Check if task exists at all
-			if _, statErr := os.Stat(filepath.Join(b.taskDir(projectID, taskID), "task.md")); statErr == nil {
-				return "", nil // Task exists but no result yet
-			}
-			return "", fmt.Errorf("task %q not found in project %q", taskID, projectID)
-		}
-		return "", fmt.Errorf("failed to read result: %w", err)
-	}
-	return string(data), nil
+	return b.store.GetResult(projectID, taskID)
 }
 
+// GetTaskMD returns the task description.
 func (b *Broker) GetTaskMD(projectID, taskID string) (string, error) {
 	if !isSafeID(taskID) {
 		return "", fmt.Errorf("invalid task_id")
 	}
-	path := filepath.Join(b.taskDir(projectID, taskID), "task.md")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("failed to read task.md: %w", err)
-	}
-	return string(data), nil
+	return b.store.GetTaskMD(projectID, taskID)
 }
 
+// ListTasks returns task metadata filtered by optional role and status.
 func (b *Broker) ListTasks(projectID, role, status string) ([]StatusMetadata, error) {
-	var tasks []StatusMetadata
-
-	dir := filepath.Join(b.dataDir, projectID)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return tasks, nil
-		}
-		return nil, fmt.Errorf("failed to read project dir: %w", err)
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		taskID := entry.Name()
-		if !isSafeID(taskID) {
-			continue
-		}
-
-		meta, err := b.GetTaskStatus(projectID, taskID)
-		if err != nil {
-			continue // Skip errors
-		}
-
-		if role != "" && meta.Role != role {
-			continue
-		}
-		if status != "" && string(meta.Status) != status {
-			continue
-		}
-
-		tasks = append(tasks, *meta)
-	}
-	return tasks, nil
+	return b.store.ListTasks(projectID, role, status)
 }
 
 // PromptMetadata represents basic information about a prompt.

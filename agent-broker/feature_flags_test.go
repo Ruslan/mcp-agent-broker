@@ -2,16 +2,12 @@ package main
 
 import (
 	"encoding/json"
-	"os"
 	"strings"
 	"testing"
 )
 
 func TestFeatureFlags_SyncOnly(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-flags-sync-*")
-	defer os.RemoveAll(tmpDir)
-
-	broker, _ := NewBroker(tmpDir, "", true, false)
+	broker := newTestBroker(t, true, false)
 	handler := &JSONRPCHandler{broker: broker}
 
 	// 1. Check tools/list - await_task should be there, listen_role should have only "wait"
@@ -56,10 +52,7 @@ func TestFeatureFlags_SyncOnly(t *testing.T) {
 }
 
 func TestFeatureFlags_AsyncOnly(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "broker-flags-async-*")
-	defer os.RemoveAll(tmpDir)
-
-	broker, _ := NewBroker(tmpDir, "", false, true)
+	broker := newTestBroker(t, false, true)
 	handler := &JSONRPCHandler{broker: broker}
 
 	// 1. Check tools/list - await_task should be missing, listen_role should have only "poll"

@@ -6,22 +6,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 )
 
 func TestJSONRPC_ServeHTTP(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "jsonrpc-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	broker, err := NewBroker(tmpDir, "", true, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	broker := newTestBroker(t, true, true)
 	handler := &JSONRPCHandler{broker: broker}
 
 	tests := []struct {
@@ -91,17 +80,7 @@ func TestJSONRPC_ServeHTTP(t *testing.T) {
 }
 
 func TestJSONRPC_HandleToolCall(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "jsonrpc-tool-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	broker, err := NewBroker(tmpDir, "", true, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	broker := newTestBroker(t, true, true)
 	handler := &JSONRPCHandler{broker: broker}
 	ctx := context.Background()
 	projectID := "default"
@@ -171,17 +150,7 @@ func TestJSONRPC_HandleToolCall(t *testing.T) {
 }
 
 func TestJSONRPC_ServeHTTP_ToolCalls(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "jsonrpc-tool-serve-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	broker, err := NewBroker(tmpDir, "", true, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	broker := newTestBroker(t, true, true)
 	handler := &JSONRPCHandler{broker: broker}
 
 	tests := []struct {

@@ -66,9 +66,9 @@ func main() {
 	}
 	addr := ":" + port
 
-	dataDir := os.Getenv("DATA_DIR")
-	if dataDir == "" {
-		dataDir = "data"
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "broker.db"
 	}
 
 	promptsDir := os.Getenv("PROMPTS_DIR")
@@ -84,7 +84,13 @@ func main() {
 		log.Fatalf("Fatal: %v", err)
 	}
 
-	broker, err := NewBroker(dataDir, promptsDir, enableSync, enableAsync)
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	broker, err := NewBroker(store, promptsDir, enableSync, enableAsync)
 	if err != nil {
 		log.Fatalf("Failed to initialize broker: %v", err)
 	}
@@ -111,7 +117,7 @@ func main() {
 		authStatus = "enabled"
 	}
 
-	log.Printf("Agent Task Broker listening on %s (data: %s, sync: %v, async: %v, auth: %s)", addr, dataDir, enableSync, enableAsync, authStatus)
+	log.Printf("Agent Task Broker listening on %s (db: %s, sync: %v, async: %v, auth: %s)", addr, dbPath, enableSync, enableAsync, authStatus)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}

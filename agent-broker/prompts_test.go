@@ -8,7 +8,6 @@ import (
 
 func TestBroker_ListPrompts_UsesFrontMatterOrder(t *testing.T) {
 	promptsDir := t.TempDir()
-	dataDir := t.TempDir()
 
 	err := os.WriteFile(filepath.Join(promptsDir, "20-second.md"), []byte("---\nname: second\ndescription: Second prompt\norder: 20\n---\nBody"), 0644)
 	if err != nil {
@@ -19,7 +18,7 @@ func TestBroker_ListPrompts_UsesFrontMatterOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broker, err := NewBroker(dataDir, promptsDir, true, true)
+	broker, err := NewBroker(newTestStore(t), promptsDir, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,14 +40,13 @@ func TestBroker_ListPrompts_UsesFrontMatterOrder(t *testing.T) {
 
 func TestBroker_GetPrompt_RendersRoleName(t *testing.T) {
 	promptsDir := t.TempDir()
-	dataDir := t.TempDir()
 
 	err := os.WriteFile(filepath.Join(promptsDir, "01-worker.md"), []byte("---\nname: worker\ndescription: Worker prompt\n---\nListen on `{{role_name}}`."), 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	broker, err := NewBroker(dataDir, promptsDir, true, true)
+	broker, err := NewBroker(newTestStore(t), promptsDir, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,14 +73,13 @@ func TestBroker_GetPrompt_RendersRoleName(t *testing.T) {
 
 func TestBroker_GetPrompt_RendersGenericArguments(t *testing.T) {
 	promptsDir := t.TempDir()
-	dataDir := t.TempDir()
 
 	err := os.WriteFile(filepath.Join(promptsDir, "02-reviewer.md"), []byte("---\nname: reviewer\ndescription: Reviewer prompt\n---\nFocus: {{review_focus}} on {{role_name}}."), 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	broker, err := NewBroker(dataDir, promptsDir, true, true)
+	broker, err := NewBroker(newTestStore(t), promptsDir, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}

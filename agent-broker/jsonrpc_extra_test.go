@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"testing"
 	"time"
 )
@@ -20,9 +19,7 @@ func TestRPCError_Error(t *testing.T) {
 }
 
 func TestHandleToolCall_ProgressTask(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "jsonrpc-progress-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 	handler := &JSONRPCHandler{broker: broker}
 	ctx := context.Background()
 	projectID := "default"
@@ -60,9 +57,7 @@ func TestHandleToolCall_ProgressTask(t *testing.T) {
 }
 
 func TestHandleToolCall_ProgressTask_Validation(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "jsonrpc-progress-val-*")
-	defer os.RemoveAll(tmpDir)
-	broker, _ := NewBroker(tmpDir, "", true, true)
+	broker := newTestBroker(t, true, true)
 	handler := &JSONRPCHandler{broker: broker}
 	ctx := context.Background()
 	projectID := "default"
