@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // JSON-RPC 2.0 types
@@ -299,10 +301,14 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			rpcErr = &RPCError{Code: ErrInvalidParams, Message: "Invalid params"}
 		} else {
+			start := time.Now()
 			res, err := h.handleToolCall(ctx, projectID, params.Name, params.Arguments)
+			elapsed := time.Since(start)
 			if err != nil {
+				log.Printf("tool=%s project=%s err=%q elapsed=%s", params.Name, projectID, err.Error(), elapsed.Round(time.Millisecond))
 				rpcErr = &RPCError{Code: ErrApp, Message: err.Error()}
 			} else {
+				log.Printf("tool=%s project=%s ok elapsed=%s", params.Name, projectID, elapsed.Round(time.Millisecond))
 				resJSON, _ := json.Marshal(res)
 				result = map[string]any{
 					"content": []any{map[string]any{"type": "text", "text": string(resJSON)}},

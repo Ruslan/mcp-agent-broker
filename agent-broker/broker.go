@@ -106,6 +106,37 @@ func NewBroker(store Store, promptsDir string, enableSync, enableAsync bool) (*B
 		adminSubs:   make(map[chan statusEvent]struct{}),
 	}
 	b.generateID = generateTaskID
+
+	// Restore active tasks from DB so SolveTask/ProgressTask work after a restart.
+	activeTasks, err := store.LoadActiveTasks()
+	if err != nil {
+		return nil, fmt.Errorf("failed to restore active tasks: %w", err)
+	}
+	for _, r := range activeTasks {
+		task := &Task{
+			ID:        r.TaskID,
+			ProjectID: r.ProjectID,
+			Role:      r.Role,
+			Title:     r.Title,
+			MD:        r.TaskMD,
+			done:      make(chan string, 1),
+			progress:  make(chan string, 32),
+		}
+		if b.tasks[r.ProjectID] == nil {
+			b.tasks[r.ProjectID] = make(map[string]*Task)
+		}
+		b.tasks[r.ProjectID][r.TaskID] = task
+		if r.Status == StatusQueued {
+			if b.asyncQueue[r.ProjectID] == nil {
+				b.asyncQueue[r.ProjectID] = make(map[string][]*Task)
+			}
+			b.asyncQueue[r.ProjectID][r.Role] = append(b.asyncQueue[r.ProjectID][r.Role], task)
+		}
+	}
+	if len(activeTasks) > 0 {
+		log.Printf("Restored %d active task(s) from database", len(activeTasks))
+	}
+
 	return b, nil
 }
 
@@ -215,6 +246,7 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 		UpdatedAt: time.Now().UTC(),
 	})
 
+	log.Printf("task created: project=%s task=%s role=%s title=%q", projectID, taskID, role, title)
 	return taskID, nil
 }
 
@@ -420,11 +452,13 @@ func (b *Broker) SolveTask(projectID, taskID, resultMD string) error {
 	projectTasks, ok := b.tasks[projectID]
 	if !ok {
 		b.mu.Unlock()
+		log.Printf("solve_task failed: project=%s task=%s reason=project_not_in_memory", projectID, taskID)
 		return fmt.Errorf("project %q not found or has no active tasks", projectID)
 	}
 	task, exists := projectTasks[taskID]
 	if !exists {
 		b.mu.Unlock()
+		log.Printf("solve_task failed: project=%s task=%s reason=task_not_in_memory", projectID, taskID)
 		return fmt.Errorf("task %q not found in memory for project %q", taskID, projectID)
 	}
 
@@ -447,6 +481,7 @@ func (b *Broker) SolveTask(projectID, taskID, resultMD string) error {
 		UpdatedAt: time.Now().UTC(),
 	})
 
+	log.Printf("task solved: project=%s task=%s", projectID, taskID)
 	select {
 	case task.done <- resultMD:
 	default:

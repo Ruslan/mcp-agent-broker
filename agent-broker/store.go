@@ -13,6 +13,16 @@ import (
 // ErrTaskExists is returned by InsertTask when a task with the same ID already exists.
 var ErrTaskExists = errors.New("task already exists")
 
+// TaskRecord is a full task row returned by LoadActiveTasks (used for startup recovery).
+type TaskRecord struct {
+	ProjectID string
+	TaskID    string
+	Role      string
+	Title     string
+	TaskMD    string
+	Status    TaskStatus
+}
+
 // Store abstracts all persistence operations. Implementations may use SQLite,
 // an in-memory map (tests), or any other backend.
 type Store interface {
@@ -35,6 +45,8 @@ type Store interface {
 	GetResult(projectID, taskID string) (string, error)
 	ListTasks(projectID, role, status string) ([]StatusMetadata, error)
 	ListProjects() ([]string, error)
+	// LoadActiveTasks returns all queued and picked tasks for memory restoration on startup.
+	LoadActiveTasks() ([]TaskRecord, error)
 
 	Close() error
 }
@@ -277,6 +289,27 @@ func (s *SQLiteStore) ListTasks(projectID, role, status string) ([]StatusMetadat
 		tasks = []StatusMetadata{}
 	}
 	return tasks, rows.Err()
+}
+
+func (s *SQLiteStore) LoadActiveTasks() ([]TaskRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT project_id, task_id, role, title, task_md, status
+		 FROM tasks WHERE status IN ('queued', 'picked') ORDER BY created_at ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load active tasks: %w", err)
+	}
+	defer rows.Close()
+
+	var records []TaskRecord
+	for rows.Next() {
+		var r TaskRecord
+		if err := rows.Scan(&r.ProjectID, &r.TaskID, &r.Role, &r.Title, &r.TaskMD, &r.Status); err != nil {
+			return nil, fmt.Errorf("failed to scan active task: %w", err)
+		}
+		records = append(records, r)
+	}
+	return records, rows.Err()
 }
 
 func (s *SQLiteStore) Close() error {

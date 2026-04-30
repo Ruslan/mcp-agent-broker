@@ -10,7 +10,8 @@
       "WebFetch(domain:github.com)",
       "Bash(grep:*)",
       "Bash(go get:*)",
-      "Bash(go build:*)"
+      "Bash(go build:*)",
+      "Bash(sqlite3:*)"
     ]
   }
 }
