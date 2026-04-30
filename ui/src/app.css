@@ -106,12 +106,28 @@ pre {
 
 .task-row {
   border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  border-left: none;
+  border-right: none;
+  border-top: none;
+  border-radius: 0;
+  cursor: pointer;
+  width: auto;
+  appearance: none;
+  text-align: left;
 }
 
 .task-row:hover {
   background: rgba(99, 102, 241, 0.05);
   cursor: pointer;
   transform: translateX(4px);
+}
+
+.task-row:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+  background: rgba(99, 102, 241, 0.1);
 }
 
 .task-row div {
@@ -237,4 +253,52 @@ footer {
 .view-tabs button.active {
   background: var(--primary);
   border-color: var(--primary);
+}
+
+.markdown-body {
+  background: #0b1120;
+  padding: 1.25rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  font-size: 0.95rem;
+  color: #e2e8f0;
+  line-height: 1.6;
+}
+
+.markdown-body h1, .markdown-body h2, .markdown-body h3 {
+  margin-top: 1.5rem;
+  margin-bottom: 1rem;
+  color: var(--text-white);
+}
+
+.markdown-body p {
+  margin-bottom: 1rem;
+}
+
+.markdown-body ul, .markdown-body ol {
+  margin-bottom: 1rem;
+  padding-left: 1.5rem;
+}
+
+.markdown-body code {
+  background: rgba(255, 255, 255, 0.1);
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+.markdown-body pre {
+  margin: 1rem 0;
+  padding: 1rem;
+  background: #010409;
+  border: 1px solid var(--border);
+}
+
+.markdown-body pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.markdown-body a {
+  color: var(--primary);
 }

@@ -13,5 +13,9 @@
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "svelte": "^5.55.4",
     "vite": "^8.0.10"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.1",
+    "marked": "^18.0.2"
   }
 }

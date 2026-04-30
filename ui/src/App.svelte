@@ -1,6 +1,8 @@
 <script>
   import './app.css';
   import { onMount, onDestroy } from 'svelte';
+  import { marked } from 'marked';
+  import DOMPurify from 'dompurify';
 
   let currentView = $state('tasks'); // 'tasks' or 'prompts'
   let projects = $state([]);
@@ -85,6 +87,18 @@
   function formatDate(d) {
     return new Date(d).toLocaleTimeString();
   }
+
+  function renderMarkdown(md) {
+    if (!md) return '';
+    return DOMPurify.sanitize(marked.parse(md));
+  }
+
+  function handleKeydown(e, callback) {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      callback();
+    }
+  }
 </script>
 
 <main class="container">
@@ -136,7 +150,11 @@
         <div>Task ID</div>
       </div>
       {#each tasks as task}
-        <div class="grid-tasks task-row" onclick={() => showTask(task.task_id)}>
+        <div class="grid-tasks task-row" 
+             role="button" 
+             tabindex="0" 
+             onclick={() => showTask(task.task_id)}
+             onkeydown={(e) => handleKeydown(e, () => showTask(task.task_id))}>
           <div><strong>{task.title}</strong></div>
           <div><kbd>{task.role}</kbd></div>
           <div class="status-{task.status}">{task.status}</div>
@@ -153,7 +171,12 @@
         <div>Description</div>
       </div>
       {#each prompts as prompt}
-        <div class="grid-tasks task-row" style="grid-template-columns: 1fr 2fr 3fr;" onclick={() => showPrompt(prompt.name)}>
+        <div class="grid-tasks task-row" 
+             style="grid-template-columns: 1fr 2fr 3fr;" 
+             role="button" 
+             tabindex="0" 
+             onclick={() => showPrompt(prompt.name)}
+             onkeydown={(e) => handleKeydown(e, () => showPrompt(prompt.name))}>
           <div><strong>{prompt.name}</strong></div>
           <div>{prompt.title || ''}</div>
           <div class="status-queued">{prompt.description || ''}</div>
@@ -176,7 +199,7 @@
         </div>
         
         <h5>Task Description</h5>
-        <pre>{selectedTask.task_md}</pre>
+        <div class="markdown-body">{@html renderMarkdown(selectedTask.task_md)}</div>
 
         {#if selectedTask.progress && selectedTask.progress.length > 0}
           <h5>Progress Log</h5>
@@ -189,7 +212,7 @@
 
         {#if selectedTask.result_md}
           <h5>Result</h5>
-          <pre>{selectedTask.result_md}</pre>
+          <div class="markdown-body">{@html renderMarkdown(selectedTask.result_md)}</div>
         {/if}
 
         <footer>
@@ -253,7 +276,7 @@
         {/if}
 
         <h5>Template Body</h5>
-        <pre>{selectedPrompt.body}</pre>
+        <div class="markdown-body">{@html renderMarkdown(selectedPrompt.body)}</div>
 
         <footer>
           <div class="modal-footer" style="justify-content: flex-end;">
