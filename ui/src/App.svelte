@@ -31,6 +31,17 @@
     selectedTask = await res.json();
   }
 
+  async function deleteTask(taskID) {
+    if (!confirm('Are you sure you want to delete this task?')) return;
+    const res = await fetch(`./api/tasks/${taskID}?project=${selectedProject}`, { method: 'DELETE' });
+    if (!res.ok) {
+      alert(`Failed to delete task: ${await res.text()}`);
+      return;
+    }
+    selectedTask = null;
+    fetchTasks();
+  }
+
   function setupSSE() {
     if (eventSource) eventSource.close();
     eventSource = new EventSource('./events');
@@ -124,13 +135,25 @@
         <h5>Task Description</h5>
         <pre>{selectedTask.task_md}</pre>
 
+        {#if selectedTask.progress && selectedTask.progress.length > 0}
+          <h5>Progress Log</h5>
+          <div class="progress-log">
+            {#each selectedTask.progress as msg}
+              <div class="progress-entry">{msg}</div>
+            {/each}
+          </div>
+        {/if}
+
         {#if selectedTask.result_md}
           <h5>Result</h5>
           <pre>{selectedTask.result_md}</pre>
         {/if}
 
         <footer>
-          <button class="secondary" onclick={() => selectedTask = null}>Close</button>
+          <div class="modal-footer">
+            <button class="outline contrast" onclick={() => deleteTask(selectedTask.metadata.task_id)}>Delete Task</button>
+            <button class="secondary" onclick={() => selectedTask = null}>Close</button>
+          </div>
         </footer>
       </article>
     </dialog>

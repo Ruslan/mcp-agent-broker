@@ -222,14 +222,14 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 // Non-blocking: if the progress buffer (32) is full, the message is dropped with a log warning.
 func (b *Broker) ReportProgress(projectID, taskID, message string) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	projectTasks, ok := b.tasks[projectID]
 	if !ok {
+		b.mu.Unlock()
 		return fmt.Errorf("task %q not found in project %q", taskID, projectID)
 	}
 	task, exists := projectTasks[taskID]
 	if !exists {
+		b.mu.Unlock()
 		return fmt.Errorf("task %q not found in project %q", taskID, projectID)
 	}
 
@@ -238,6 +238,12 @@ func (b *Broker) ReportProgress(projectID, taskID, message string) error {
 	default:
 		log.Printf("progress buffer full for task %s, dropping message", taskID)
 	}
+	b.mu.Unlock()
+
+	if err := b.store.AppendProgress(projectID, taskID, message); err != nil {
+		log.Printf("failed to persist progress for task %s: %v", taskID, err)
+	}
+
 	return nil
 }
 
@@ -475,6 +481,29 @@ func (b *Broker) GetTaskMD(projectID, taskID string) (string, error) {
 // ListTasks returns task metadata filtered by optional role and status.
 func (b *Broker) ListTasks(projectID, role, status string) ([]StatusMetadata, error) {
 	return b.store.ListTasks(projectID, role, status)
+}
+
+// DeleteTask removes a task and its associated data.
+func (b *Broker) DeleteTask(projectID, taskID string) error {
+	if !isSafeID(taskID) {
+		return fmt.Errorf("invalid task_id")
+	}
+	b.mu.Lock()
+	projectTasks, ok := b.tasks[projectID]
+	if ok {
+		delete(projectTasks, taskID)
+		if len(projectTasks) == 0 {
+			delete(b.tasks, projectID)
+		}
+	}
+	b.mu.Unlock()
+
+	return b.store.DeleteTask(projectID, taskID)
+}
+
+// GetTaskProgress returns all progress messages for a task.
+func (b *Broker) GetTaskProgress(projectID, taskID string) ([]string, error) {
+	return b.store.GetProgress(projectID, taskID)
 }
 
 // ListProjects returns a list of distinct project IDs.

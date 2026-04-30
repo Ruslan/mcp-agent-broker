@@ -17,6 +17,10 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/admin/api/tasks/") {
+		if r.Method == http.MethodDelete {
+			h.deleteTask(w, r)
+			return
+		}
 		h.getTask(w, r)
 		return
 	}
@@ -74,15 +78,32 @@ func (h *AdminHandler) getTask(w http.ResponseWriter, r *http.Request) {
 
 	taskMD, _ := h.broker.GetTaskMD(projectID, taskID)
 	resultMD, _ := h.broker.GetTaskResult(projectID, taskID)
+	progress, _ := h.broker.GetTaskProgress(projectID, taskID)
 
 	resp := map[string]any{
 		"metadata":  meta,
 		"task_md":   taskMD,
 		"result_md": resultMD,
+		"progress":  progress,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func (h *AdminHandler) deleteTask(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimSuffix(r.URL.Path, "/"), "/")
+	taskID := parts[len(parts)-1]
+	projectID := r.URL.Query().Get("project")
+	if projectID == "" {
+		projectID = "default"
+	}
+
+	if err := h.broker.DeleteTask(projectID, taskID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *AdminHandler) eventsHandler(w http.ResponseWriter, r *http.Request) {

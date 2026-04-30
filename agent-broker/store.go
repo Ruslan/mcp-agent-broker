@@ -25,6 +25,10 @@ type Store interface {
 	SaveResult(projectID, taskID, resultMD string) error
 	// DeleteTask removes a task row (used for cleanup on failed delivery).
 	DeleteTask(projectID, taskID string) error
+	// AppendProgress adds a progress message to the task's log.
+	AppendProgress(projectID, taskID, message string) error
+	// GetProgress retrieves all progress messages for a task.
+	GetProgress(projectID, taskID string) ([]string, error)
 
 	GetStatus(projectID, taskID string) (*StatusMetadata, error)
 	GetTaskMD(projectID, taskID string) (string, error)
@@ -77,6 +81,15 @@ func sqliteMigrate(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_project_role   ON tasks (project_id, role)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks (project_id, status)`,
+		`CREATE TABLE IF NOT EXISTS task_progress (
+			project_id TEXT NOT NULL,
+			task_id    TEXT NOT NULL,
+			sequence   INTEGER PRIMARY KEY AUTOINCREMENT,
+			message    TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			FOREIGN KEY (project_id, task_id) REFERENCES tasks (project_id, task_id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_progress_task ON task_progress (project_id, task_id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -140,6 +153,40 @@ func (s *SQLiteStore) DeleteTask(projectID, taskID string) error {
 		projectID, taskID,
 	)
 	return err
+}
+
+func (s *SQLiteStore) AppendProgress(projectID, taskID, message string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.Exec(
+		`INSERT INTO task_progress (project_id, task_id, message, created_at)
+		 VALUES (?, ?, ?, ?)`,
+		projectID, taskID, message, now,
+	)
+	return err
+}
+
+func (s *SQLiteStore) GetProgress(projectID, taskID string) ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT message FROM task_progress WHERE project_id = ? AND task_id = ? ORDER BY sequence ASC`,
+		projectID, taskID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read progress: %w", err)
+	}
+	defer rows.Close()
+
+	var progress []string
+	for rows.Next() {
+		var msg string
+		if err := rows.Scan(&msg); err != nil {
+			return nil, fmt.Errorf("failed to scan progress: %w", err)
+		}
+		progress = append(progress, msg)
+	}
+	if progress == nil {
+		progress = []string{}
+	}
+	return progress, rows.Err()
 }
 
 func (s *SQLiteStore) GetStatus(projectID, taskID string) (*StatusMetadata, error) {

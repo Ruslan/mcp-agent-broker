@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -112,7 +113,11 @@ func main() {
 	mux.Handle("/admin/events", adminHandler)
 
 	// Admin UI (SPA)
-	mux.Handle("/admin/", http.StripPrefix("/admin", http.FileServer(http.FS(adminFS))))
+	adminDist, err := fs.Sub(adminFS, "dist")
+	if err != nil {
+		log.Fatalf("Failed to open embedded admin UI: %v", err)
+	}
+	mux.Handle("/admin/", http.StripPrefix("/admin", http.FileServer(http.FS(adminDist))))
 
 	wrappedMux := AuthMiddleware(apiKey, mux)
 
