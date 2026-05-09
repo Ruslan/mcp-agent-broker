@@ -302,3 +302,30 @@ footer {
 .markdown-body a {
   color: var(--primary);
 }
+
+.load-more {
+  display: flex;
+  justify-content: center;
+  padding: 1.5rem 0;
+}
+
+.load-more button {
+  min-width: 200px;
+}
+
+.status-edit {
+  margin-bottom: 1rem;
+}
+
+.status-edit label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.status-edit select {
+  width: auto;
+  min-width: 120px;
+}

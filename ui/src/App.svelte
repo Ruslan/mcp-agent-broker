@@ -4,9 +4,12 @@
   import { marked } from 'marked';
   import DOMPurify from 'dompurify';
 
-  let currentView = $state('tasks'); // 'tasks' or 'prompts'
+  const PAGE_SIZE = 50;
+
+  let currentView = $state('tasks');
   let projects = $state([]);
   let tasks = $state([]);
+  let totalTasks = $state(0);
   let prompts = $state([]);
   let selectedTask = $state(null);
   let selectedPrompt = $state(null);
@@ -21,14 +24,22 @@
     projects = await res.json();
   }
 
-  async function fetchTasks() {
+  async function fetchTasks(reset = true) {
     const params = new URLSearchParams({
       project: selectedProject,
       role: filterRole,
-      status: filterStatus
+      status: filterStatus,
+      limit: String(PAGE_SIZE),
+      offset: reset ? '0' : String(tasks.length)
     });
     const res = await fetch(`./api/tasks?${params}`);
-    tasks = await res.json();
+    const data = await res.json();
+    if (reset) {
+      tasks = data.tasks;
+    } else {
+      tasks = [...tasks, ...data.tasks];
+    }
+    totalTasks = data.total;
   }
 
   async function fetchPrompts() {
@@ -49,7 +60,23 @@
       return;
     }
     selectedTask = null;
-    fetchTasks();
+    fetchTasks(true);
+  }
+
+  async function updateStatus(taskID, newStatus) {
+    if (!newStatus) return;
+    if (!confirm(`Change status to "${newStatus}"?`)) return;
+    const res = await fetch(`./api/tasks/${taskID}?project=${selectedProject}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: newStatus })
+    });
+    if (!res.ok) {
+      alert(`Failed to update status: ${await res.text()}`);
+      return;
+    }
+    showTask(taskID);
+    fetchTasks(true);
   }
 
   async function showPrompt(name) {
@@ -64,7 +91,7 @@
       const update = JSON.parse(e.data);
       if (update.project_id === selectedProject) {
         if (currentView === 'tasks') {
-          fetchTasks();
+          fetchTasks(true);
         }
         if (selectedTask && selectedTask.metadata.task_id === update.task_id) {
           showTask(update.task_id);
@@ -75,7 +102,7 @@
 
   onMount(() => {
     fetchProjects();
-    fetchTasks();
+    fetchTasks(true);
     fetchPrompts();
     setupSSE();
   });
@@ -114,7 +141,7 @@
       {#if currentView === 'tasks'}
         <ul>
           <li>
-            <select bind:value={selectedProject} onchange={fetchTasks}>
+            <select bind:value={selectedProject} onchange={() => fetchTasks(true)}>
               {#each projects as p}
                 <option value={p}>{p}</option>
               {/each}
@@ -122,9 +149,9 @@
           </li>
         </ul>
         <ul>
-          <li><input type="text" placeholder="Filter Role" bind:value={filterRole} oninput={fetchTasks} /></li>
+          <li><input type="text" placeholder="Filter Role" bind:value={filterRole} oninput={() => fetchTasks(true)} /></li>
           <li>
-            <select bind:value={filterStatus} onchange={fetchTasks}>
+            <select bind:value={filterStatus} onchange={() => fetchTasks(true)}>
               <option value="">All Statuses</option>
               <option value="queued">Queued</option>
               <option value="picked">Picked</option>
@@ -150,9 +177,9 @@
         <div>Task ID</div>
       </div>
       {#each tasks as task}
-        <div class="grid-tasks task-row" 
-             role="button" 
-             tabindex="0" 
+        <div class="grid-tasks task-row"
+             role="button"
+             tabindex="0"
              onclick={() => showTask(task.task_id)}
              onkeydown={(e) => handleKeydown(e, () => showTask(task.task_id))}>
           <div><strong>{task.title}</strong></div>
@@ -162,6 +189,13 @@
           <div><code>{task.task_id.slice(0,8)}...</code></div>
         </div>
       {/each}
+      {#if tasks.length < totalTasks}
+        <div class="load-more">
+          <button class="outline" onclick={() => fetchTasks(false)}>
+            Load more ({tasks.length} of {totalTasks})
+          </button>
+        </div>
+      {/if}
     </section>
   {:else}
     <section>
@@ -171,10 +205,10 @@
         <div>Description</div>
       </div>
       {#each prompts as prompt}
-        <div class="grid-tasks task-row" 
-             style="grid-template-columns: 1fr 2fr 3fr;" 
-             role="button" 
-             tabindex="0" 
+        <div class="grid-tasks task-row"
+             style="grid-template-columns: 1fr 2fr 3fr;"
+             role="button"
+             tabindex="0"
              onclick={() => showPrompt(prompt.name)}
              onkeydown={(e) => handleKeydown(e, () => showPrompt(prompt.name))}>
           <div><strong>{prompt.name}</strong></div>
@@ -197,7 +231,22 @@
           <div><strong>Role:</strong> {selectedTask.metadata.role}</div>
           <div><strong>Updated:</strong> {formatDate(selectedTask.metadata.updated_at)}</div>
         </div>
-        
+
+        <div class="status-edit">
+          <label>
+            Change status:
+            <select onchange={(e) => updateStatus(selectedTask.metadata.task_id, e.target.value)}>
+              <option value="">--</option>
+              {#if selectedTask.metadata.status !== 'queued'}
+                <option value="queued">queued</option>
+              {/if}
+              {#if selectedTask.metadata.status !== 'solved'}
+                <option value="solved">solved</option>
+              {/if}
+            </select>
+          </label>
+        </div>
+
         <h5>Task Description</h5>
         <div class="markdown-body">{@html renderMarkdown(selectedTask.task_md)}</div>
 
@@ -232,7 +281,7 @@
           <a href="#close" aria-label="Close" class="close" onclick={() => selectedPrompt = null}></a>
           Prompt: {selectedPrompt.metadata.name}
         </header>
-        
+
         <h5>Metadata</h5>
         <table class="meta-table">
           <thead>

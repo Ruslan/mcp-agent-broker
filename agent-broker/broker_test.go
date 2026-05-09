@@ -210,8 +210,8 @@ func TestBroker_DuplicateSolve(t *testing.T) {
 	}
 
 	err = broker.SolveTask(testProject, taskID, "Result 2")
-	if err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Errorf("Expected not found error on duplicate solve, got %v", err)
+	if err != nil {
+		t.Errorf("Expected duplicate solve to be idempotent (no error), got %v", err)
 	}
 }
 
@@ -236,12 +236,12 @@ func TestBroker_ListTasks(t *testing.T) {
 	broker.CreateTask(testProject, "coder", "Task 1", "MD")
 	broker.CreateTask(testProject, "reviewer", "Task 2", "MD")
 
-	tasks, _ := broker.ListTasks(testProject, "", "")
+	tasks, _ := broker.ListTasks(testProject, "", "", 0, 0)
 	if len(tasks) != 2 {
 		t.Errorf("Expected 2 tasks, got %d", len(tasks))
 	}
 
-	tasks, _ = broker.ListTasks(testProject, "coder", "")
+	tasks, _ = broker.ListTasks(testProject, "coder", "", 0, 0)
 	if len(tasks) != 1 || tasks[0].Role != "coder" {
 		t.Errorf("Expected 1 coder task, got %d", len(tasks))
 	}

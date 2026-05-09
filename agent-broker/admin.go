@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -19,6 +20,10 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/admin/api/tasks/") {
 		if r.Method == http.MethodDelete {
 			h.deleteTask(w, r)
+			return
+		}
+		if r.Method == http.MethodPatch {
+			h.updateTaskStatus(w, r)
 			return
 		}
 		h.getTask(w, r)
@@ -61,13 +66,31 @@ func (h *AdminHandler) listTasks(w http.ResponseWriter, r *http.Request) {
 	role := r.URL.Query().Get("role")
 	status := r.URL.Query().Get("status")
 
-	tasks, err := h.broker.ListTasks(projectID, role, status)
+	limit := 0
+	offset := 0
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
+		limit = l
+	}
+	if o, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && o > 0 {
+		offset = o
+	}
+
+	tasks, err := h.broker.ListTasks(projectID, role, status, limit, offset)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	total, err := h.broker.CountTasks(projectID, role, status)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tasks)
+	json.NewEncoder(w).Encode(map[string]any{
+		"tasks": tasks,
+		"total": total,
+	})
 }
 
 func (h *AdminHandler) getTask(w http.ResponseWriter, r *http.Request) {
@@ -109,6 +132,29 @@ func (h *AdminHandler) deleteTask(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.broker.DeleteTask(projectID, taskID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *AdminHandler) updateTaskStatus(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimSuffix(r.URL.Path, "/"), "/")
+	taskID := parts[len(parts)-1]
+	projectID := r.URL.Query().Get("project")
+	if projectID == "" {
+		projectID = "default"
+	}
+
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.broker.AdminUpdateStatus(projectID, taskID, body.Status); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

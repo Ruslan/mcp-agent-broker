@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+type awaitResult struct {
+	status   string
+	result   string
+	progress []string
+	err      error
+}
+
 func TestBroker_GetTaskMD_And_Result(t *testing.T) {
 	broker := newTestBroker(t, true, true)
 
@@ -155,5 +162,124 @@ func TestBroker_ReportProgress_AfterSolve(t *testing.T) {
 	err := broker.ReportProgress(projectID, taskID, "too late")
 	if err == nil {
 		t.Error("Expected error for progress after solve")
+	}
+}
+
+func TestBroker_AdminUpdateStatus_RequeuePickedTaskKeepsTaskActive(t *testing.T) {
+	broker := newTestBroker(t, true, true)
+
+	projectID := "default"
+	taskID, err := broker.CreateTask(projectID, "coder", "Title", "task content")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, status, err := broker.ListenRole(context.Background(), projectID, "coder", "poll", 0); err != nil || status != "picked" {
+		t.Fatalf("ListenRole(poll) failed: status=%s err=%v", status, err)
+	}
+	if err := broker.ReportProgress(projectID, taskID, "first attempt"); err != nil {
+		t.Fatalf("ReportProgress before requeue failed: %v", err)
+	}
+
+	resultCh := make(chan awaitResult, 1)
+	go func() {
+		status, result, progress, err := broker.AwaitTask(context.Background(), projectID, taskID, 0)
+		resultCh <- awaitResult{status: status, result: result, progress: progress, err: err}
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	if err := broker.AdminUpdateStatus(projectID, taskID, "queued"); err != nil {
+		t.Fatalf("AdminUpdateStatus(queued) failed: %v", err)
+	}
+
+	meta, err := broker.GetTaskStatus(projectID, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Status != StatusQueued {
+		t.Fatalf("Expected status queued after admin reset, got %s", meta.Status)
+	}
+
+	task, status, err := broker.ListenRole(context.Background(), projectID, "coder", "poll", 0)
+	if err != nil || task == nil || status != "picked" {
+		t.Fatalf("Expected requeued task to be picked again, got task=%v status=%s err=%v", task, status, err)
+	}
+	if task.MD != "task content" {
+		t.Fatalf("Expected requeued task_md to be preserved, got %q", task.MD)
+	}
+
+	if err := broker.ReportProgress(projectID, taskID, "second attempt"); err != nil {
+		t.Fatalf("ReportProgress after requeue failed: %v", err)
+	}
+	if err := broker.SolveTask(projectID, taskID, "final result"); err != nil {
+		t.Fatalf("SolveTask after requeue failed: %v", err)
+	}
+
+	select {
+	case got := <-resultCh:
+		if got.err != nil {
+			t.Fatalf("AwaitTask returned error: %v", got.err)
+		}
+		if got.status != string(StatusSolved) {
+			t.Fatalf("Expected solved status, got %s", got.status)
+		}
+		if got.result != "final result" {
+			t.Fatalf("Expected final result, got %q", got.result)
+		}
+		if len(got.progress) != 2 {
+			t.Fatalf("Expected 2 progress messages, got %d: %v", len(got.progress), got.progress)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("AwaitTask hung after admin requeue")
+	}
+}
+
+func TestBroker_AdminUpdateStatus_RequeueSolvedTaskRestoresTask(t *testing.T) {
+	broker := newTestBroker(t, true, true)
+
+	projectID := "default"
+	taskID, err := broker.CreateTask(projectID, "coder", "Title", "task content")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, status, err := broker.ListenRole(context.Background(), projectID, "coder", "poll", 0); err != nil || status != "picked" {
+		t.Fatalf("ListenRole(poll) failed: status=%s err=%v", status, err)
+	}
+	if err := broker.SolveTask(projectID, taskID, "done"); err != nil {
+		t.Fatalf("SolveTask failed: %v", err)
+	}
+
+	if err := broker.AdminUpdateStatus(projectID, taskID, "queued"); err != nil {
+		t.Fatalf("AdminUpdateStatus(queued) failed: %v", err)
+	}
+
+	task, status, err := broker.ListenRole(context.Background(), projectID, "coder", "poll", 0)
+	if err != nil || task == nil || status != "picked" {
+		t.Fatalf("Expected solved task to be requeued and picked, got task=%v status=%s err=%v", task, status, err)
+	}
+	if task.MD != "task content" {
+		t.Fatalf("Expected task_md to be restored after solved->queued, got %q", task.MD)
+	}
+	if err := broker.ReportProgress(projectID, taskID, "retry"); err != nil {
+		t.Fatalf("Expected requeued solved task to be tracked in memory, got %v", err)
+	}
+}
+
+func TestBroker_ListTasks_OffsetWithoutLimit(t *testing.T) {
+	broker := newTestBroker(t, true, true)
+
+	for i := 0; i < 3; i++ {
+		if _, err := broker.CreateTask(testProject, "coder", "Title", "MD"); err != nil {
+			t.Fatalf("CreateTask failed: %v", err)
+		}
+	}
+
+	tasks, err := broker.ListTasks(testProject, "", "", 0, 1)
+	if err != nil {
+		t.Fatalf("ListTasks with offset only failed: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("Expected 2 tasks after offsetting one row, got %d", len(tasks))
 	}
 }

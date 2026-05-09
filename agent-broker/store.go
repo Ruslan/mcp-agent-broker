@@ -33,6 +33,8 @@ type Store interface {
 	UpdateStatus(projectID, taskID string, status TaskStatus) error
 	// SaveResult atomically stores the result and sets status=solved.
 	SaveResult(projectID, taskID, resultMD string) error
+	// ClearResult clears the result_md field (used when admin resets task to queued).
+	ClearResult(projectID, taskID string) error
 	// DeleteTask removes a task row (used for cleanup on failed delivery).
 	DeleteTask(projectID, taskID string) error
 	// AppendProgress adds a progress message to the task's log.
@@ -43,7 +45,8 @@ type Store interface {
 	GetStatus(projectID, taskID string) (*StatusMetadata, error)
 	GetTaskMD(projectID, taskID string) (string, error)
 	GetResult(projectID, taskID string) (string, error)
-	ListTasks(projectID, role, status string) ([]StatusMetadata, error)
+	ListTasks(projectID, role, status string, limit, offset int) ([]StatusMetadata, error)
+	CountTasks(projectID, role, status string) (int, error)
 	ListProjects() ([]string, error)
 	// LoadActiveTasks returns all queued and picked tasks for memory restoration on startup.
 	LoadActiveTasks() ([]TaskRecord, error)
@@ -159,6 +162,14 @@ func (s *SQLiteStore) SaveResult(projectID, taskID, resultMD string) error {
 	return nil
 }
 
+func (s *SQLiteStore) ClearResult(projectID, taskID string) error {
+	_, err := s.db.Exec(
+		`UPDATE tasks SET result_md = NULL WHERE project_id = ? AND task_id = ?`,
+		projectID, taskID,
+	)
+	return err
+}
+
 func (s *SQLiteStore) DeleteTask(projectID, taskID string) error {
 	_, err := s.db.Exec(
 		`DELETE FROM tasks WHERE project_id = ? AND task_id = ?`,
@@ -254,7 +265,7 @@ func (s *SQLiteStore) GetResult(projectID, taskID string) (string, error) {
 	return resultMD.String, nil
 }
 
-func (s *SQLiteStore) ListTasks(projectID, role, status string) ([]StatusMetadata, error) {
+func (s *SQLiteStore) ListTasks(projectID, role, status string, limit, offset int) ([]StatusMetadata, error) {
 	query := `SELECT project_id, task_id, role, title, status, created_at, updated_at
 	          FROM tasks WHERE project_id = ?`
 	args := []any{projectID}
@@ -266,7 +277,18 @@ func (s *SQLiteStore) ListTasks(projectID, role, status string) ([]StatusMetadat
 		query += " AND status = ?"
 		args = append(args, status)
 	}
-	query += " ORDER BY created_at ASC"
+	query += " ORDER BY created_at DESC"
+
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	} else if offset > 0 {
+		query += " LIMIT -1"
+	}
+	if offset > 0 {
+		query += " OFFSET ?"
+		args = append(args, offset)
+	}
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -289,6 +311,25 @@ func (s *SQLiteStore) ListTasks(projectID, role, status string) ([]StatusMetadat
 		tasks = []StatusMetadata{}
 	}
 	return tasks, rows.Err()
+}
+
+func (s *SQLiteStore) CountTasks(projectID, role, status string) (int, error) {
+	query := `SELECT COUNT(*) FROM tasks WHERE project_id = ?`
+	args := []any{projectID}
+	if role != "" {
+		query += " AND role = ?"
+		args = append(args, role)
+	}
+	if status != "" {
+		query += " AND status = ?"
+		args = append(args, status)
+	}
+
+	var count int
+	if err := s.db.QueryRow(query, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count tasks: %w", err)
+	}
+	return count, nil
 }
 
 func (s *SQLiteStore) LoadActiveTasks() ([]TaskRecord, error) {

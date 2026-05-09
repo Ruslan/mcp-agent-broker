@@ -418,7 +418,7 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 		}
 		json.Unmarshal(args, &p) // ignoring error as all fields are optional
 
-		tasks, err := h.broker.ListTasks(projectID, p.Role, p.Status)
+		tasks, err := h.broker.ListTasks(projectID, p.Role, p.Status, 0, 0)
 		if err != nil {
 			return nil, err
 		}

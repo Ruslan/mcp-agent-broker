@@ -91,8 +91,10 @@ Admin REST API:
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/admin/api/projects` | List distinct project IDs |
-| `GET` | `/admin/api/tasks` | List tasks; query params: `project`, `role`, `status` |
-| `GET` | `/admin/api/tasks/:id` | Task detail: metadata + task_md + result_md |
+| `GET` | `/admin/api/tasks` | List tasks; query params: `project`, `role`, `status`, `limit`, `offset`; response shape: `{ "tasks": [...], "total": 123 }` |
+| `GET` | `/admin/api/tasks/:id` | Task detail: metadata + `task_md` + `result_md` + `progress` |
+| `PATCH` | `/admin/api/tasks/:id` | Update task status; JSON body: `{ "status": "queued"|"solved" }` |
+| `DELETE` | `/admin/api/tasks/:id` | Delete a task |
 | `GET` | `/admin/events` | SSE stream: live task status updates |
 
 ## Environment

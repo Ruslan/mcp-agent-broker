@@ -163,7 +163,6 @@ func generateTaskID() string {
 	return hex.EncodeToString(b)
 }
 
-
 // CreateTask enqueues a task for a role and returns immediately with a generated ID.
 func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, error) {
 	if role == "" || title == "" || taskMD == "" {
@@ -214,6 +213,13 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 				delete(b.tasks[projectID], taskID)
 				b.store.DeleteTask(projectID, taskID)
 				return "", fmt.Errorf("failed to update status to picked: %w", err)
+			}
+
+			// Wait-mode listeners are one-shot. Remove the listener before
+			// delivering so subsequent tasks are queued for the next listen call.
+			delete(projectListeners, role)
+			if len(projectListeners) == 0 {
+				delete(b.listeners, projectID)
 			}
 
 			select {
@@ -443,36 +449,29 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 }
 
 // SolveTask submits a result for a task ID and unblocks the creator.
+// Uses the database as the source of truth; in-memory state is only cleaned up
+// after the DB write succeeds.
 func (b *Broker) SolveTask(projectID, taskID, resultMD string) error {
 	if taskID == "" || resultMD == "" {
 		return fmt.Errorf("task_id and result_md are required")
 	}
 
-	b.mu.Lock()
-	projectTasks, ok := b.tasks[projectID]
-	if !ok {
-		b.mu.Unlock()
-		log.Printf("solve_task failed: project=%s task=%s reason=project_not_in_memory", projectID, taskID)
+	meta, err := b.store.GetStatus(projectID, taskID)
+	if err != nil {
 		return fmt.Errorf("project %q not found or has no active tasks", projectID)
 	}
-	task, exists := projectTasks[taskID]
-	if !exists {
-		b.mu.Unlock()
-		log.Printf("solve_task failed: project=%s task=%s reason=task_not_in_memory", projectID, taskID)
-		return fmt.Errorf("task %q not found in memory for project %q", taskID, projectID)
+
+	if meta.Status == StatusSolved {
+		if storedResult, err := b.store.GetResult(projectID, taskID); err == nil {
+			resultMD = storedResult
+		}
+		b.cleanupInMemory(projectID, taskID, resultMD)
+		return nil
 	}
 
 	if err := b.store.SaveResult(projectID, taskID, resultMD); err != nil {
-		b.mu.Unlock()
 		return fmt.Errorf("failed to save result: %w", err)
 	}
-
-	delete(projectTasks, taskID)
-	if len(projectTasks) == 0 {
-		delete(b.tasks, projectID)
-	}
-	close(task.progress)
-	b.mu.Unlock()
 
 	b.publishAdminEvent(statusEvent{
 		ProjectID: projectID,
@@ -482,11 +481,37 @@ func (b *Broker) SolveTask(projectID, taskID, resultMD string) error {
 	})
 
 	log.Printf("task solved: project=%s task=%s", projectID, taskID)
+
+	b.cleanupInMemory(projectID, taskID, resultMD)
+	return nil
+}
+
+// cleanupInMemory removes the task from the in-memory map and signals the
+// done channel so AwaitTask callers are unblocked. Safe to call when the
+// task is not in memory (no-op).
+func (b *Broker) cleanupInMemory(projectID, taskID, resultMD string) {
+	b.mu.Lock()
+	projectTasks, ok := b.tasks[projectID]
+	if !ok {
+		b.mu.Unlock()
+		return
+	}
+	task, exists := projectTasks[taskID]
+	if !exists {
+		b.mu.Unlock()
+		return
+	}
+	delete(projectTasks, taskID)
+	if len(projectTasks) == 0 {
+		delete(b.tasks, projectID)
+	}
+	close(task.progress)
+	b.mu.Unlock()
+
 	select {
 	case task.done <- resultMD:
 	default:
 	}
-	return nil
 }
 
 // GetTaskStatus returns the status metadata for a task.
@@ -514,8 +539,89 @@ func (b *Broker) GetTaskMD(projectID, taskID string) (string, error) {
 }
 
 // ListTasks returns task metadata filtered by optional role and status.
-func (b *Broker) ListTasks(projectID, role, status string) ([]StatusMetadata, error) {
-	return b.store.ListTasks(projectID, role, status)
+func (b *Broker) ListTasks(projectID, role, status string, limit, offset int) ([]StatusMetadata, error) {
+	return b.store.ListTasks(projectID, role, status, limit, offset)
+}
+
+// CountTasks returns the total number of tasks matching the filters.
+func (b *Broker) CountTasks(projectID, role, status string) (int, error) {
+	return b.store.CountTasks(projectID, role, status)
+}
+
+// AdminUpdateStatus allows admins to manually reset a task status (e.g. unstick a hanging task).
+// Allowed transitions: any status -> "queued" or "solved".
+// Setting to "queued" clears result_md. Setting to "solved" is idempotent if already solved.
+func (b *Broker) AdminUpdateStatus(projectID, taskID, newStatus string) error {
+	if !isSafeID(taskID) {
+		return fmt.Errorf("invalid task_id")
+	}
+
+	meta, err := b.store.GetStatus(projectID, taskID)
+	if err != nil {
+		return fmt.Errorf("task %q not found in project %q", taskID, projectID)
+	}
+
+	target := TaskStatus(newStatus)
+	if target != StatusQueued && target != StatusSolved {
+		return fmt.Errorf("admin can only set status to 'queued' or 'solved'")
+	}
+
+	if meta.Status == target {
+		return nil
+	}
+
+	if err := b.store.UpdateStatus(projectID, taskID, target); err != nil {
+		return err
+	}
+
+	if target == StatusQueued {
+		if err := b.store.ClearResult(projectID, taskID); err != nil {
+			return fmt.Errorf("failed to clear result: %w", err)
+		}
+
+		md, err := b.store.GetTaskMD(projectID, taskID)
+		if err != nil {
+			return fmt.Errorf("failed to reload task markdown: %w", err)
+		}
+
+		b.mu.Lock()
+		if b.tasks[projectID] == nil {
+			b.tasks[projectID] = make(map[string]*Task)
+		}
+		task, exists := b.tasks[projectID][taskID]
+		if !exists {
+			task = &Task{
+				ID:        taskID,
+				ProjectID: projectID,
+				Role:      meta.Role,
+				Title:     meta.Title,
+				MD:        md,
+				done:      make(chan string, 1),
+				progress:  make(chan string, 32),
+			}
+			b.tasks[projectID][taskID] = task
+		} else if task.MD == "" {
+			task.MD = md
+		}
+
+		if b.asyncQueue[projectID] == nil {
+			b.asyncQueue[projectID] = make(map[string][]*Task)
+		}
+		b.asyncQueue[projectID][meta.Role] = append(b.asyncQueue[projectID][meta.Role], task)
+		b.mu.Unlock()
+	} else {
+		b.cleanupInMemory(projectID, taskID, "")
+	}
+
+	b.publishAdminEvent(statusEvent{
+		ProjectID: projectID,
+		TaskID:    taskID,
+		Status:    target,
+		UpdatedAt: time.Now().UTC(),
+	})
+
+	log.Printf("admin status change: project=%s task=%s %s->%s", projectID, taskID, meta.Status, target)
+	return nil
 }
 
 // DeleteTask removes a task and its associated data.
