@@ -56,12 +56,18 @@ type Task struct {
 	progress  chan string // buffered size 32, closed by SolveTask
 }
 
+type listenerEntry struct {
+	ch        chan *Task
+	startedAt time.Time
+	timeoutMs int
+}
+
 // Broker manages the coordination between task creators and role listeners.
 type Broker struct {
 	mu         sync.Mutex
-	listeners  map[string]map[string]chan *Task // projectID -> role -> chan
-	tasks      map[string]map[string]*Task      // projectID -> taskID -> *Task
-	asyncQueue map[string]map[string][]*Task    // projectID -> role -> []*Task
+	listeners  map[string]map[string]*listenerEntry // projectID -> role -> listener
+	tasks      map[string]map[string]*Task          // projectID -> taskID -> *Task
+	asyncQueue map[string]map[string][]*Task        // projectID -> role -> []*Task
 	store      Store
 	promptsDir string
 
@@ -96,7 +102,7 @@ func NewBroker(store Store, promptsDir string, enableSync, enableAsync bool) (*B
 	}
 
 	b := &Broker{
-		listeners:   make(map[string]map[string]chan *Task),
+		listeners:   make(map[string]map[string]*listenerEntry),
 		tasks:       make(map[string]map[string]*Task),
 		asyncQueue:  make(map[string]map[string][]*Task),
 		store:       store,
@@ -163,6 +169,57 @@ func generateTaskID() string {
 	return hex.EncodeToString(b)
 }
 
+func (b *Broker) resultDiagnostics(projectID, taskID string) (bool, int, error) {
+	result, err := b.store.GetResult(projectID, taskID)
+	if err != nil {
+		return false, 0, err
+	}
+	return result != "", len(result), nil
+}
+
+func (b *Broker) memoryDiagnostics(projectID, taskID string) (bool, string, int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	inTasks := false
+	if projectTasks, ok := b.tasks[projectID]; ok {
+		_, inTasks = projectTasks[taskID]
+	}
+
+	queuedRole := ""
+	queueOccurrences := 0
+	if projectQueue, ok := b.asyncQueue[projectID]; ok {
+		for role, queue := range projectQueue {
+			for _, task := range queue {
+				if task.ID == taskID {
+					if queuedRole == "" {
+						queuedRole = role
+					}
+					queueOccurrences++
+				}
+			}
+		}
+	}
+
+	return inTasks, queuedRole, queueOccurrences
+}
+
+func (b *Broker) logPickAttempt(projectID string, task *Task, source string, queueLen int) {
+	meta, metaErr := b.store.GetStatus(projectID, task.ID)
+	resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, task.ID)
+	if metaErr != nil {
+		log.Printf("task pick attempt: source=%s project=%s task=%s role=%s queue_len=%d status_read_error=%v result_present=%t result_len=%d result_read_error=%v", source, projectID, task.ID, task.Role, queueLen, metaErr, resultPresent, resultLen, resultErr)
+		return
+	}
+
+	if meta.Status != StatusQueued || resultPresent || resultErr != nil {
+		log.Printf("task pick anomaly: source=%s project=%s task=%s role=%s queue_len=%d db_status=%s result_present=%t result_len=%d result_read_error=%v", source, projectID, task.ID, task.Role, queueLen, meta.Status, resultPresent, resultLen, resultErr)
+		return
+	}
+
+	log.Printf("task pick attempt: source=%s project=%s task=%s role=%s queue_len=%d db_status=%s result_present=%t result_len=%d", source, projectID, task.ID, task.Role, queueLen, meta.Status, resultPresent, resultLen)
+}
+
 // CreateTask enqueues a task for a role and returns immediately with a generated ID.
 func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, error) {
 	if role == "" || title == "" || taskMD == "" {
@@ -208,12 +265,15 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 
 	// If a listener is waiting, deliver directly
 	if projectListeners, ok := b.listeners[projectID]; ok {
-		if ch, hasListener := projectListeners[role]; hasListener {
+		if listener, hasListener := projectListeners[role]; hasListener {
+			listenerAge := time.Since(listener.startedAt).Round(time.Millisecond)
+			b.logPickAttempt(projectID, task, "create_task.wait_listener", 0)
 			if err := b.store.UpdateStatus(projectID, taskID, StatusPicked); err != nil {
 				delete(b.tasks[projectID], taskID)
 				b.store.DeleteTask(projectID, taskID)
 				return "", fmt.Errorf("failed to update status to picked: %w", err)
 			}
+			log.Printf("task status transition: source=create_task.wait_listener project=%s task=%s role=%s to=%s listener_age=%s listener_timeout_ms=%d", projectID, taskID, role, StatusPicked, listenerAge, listener.timeoutMs)
 
 			// Wait-mode listeners are one-shot. Remove the listener before
 			// delivering so subsequent tasks are queued for the next listen call.
@@ -223,7 +283,8 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 			}
 
 			select {
-			case ch <- task:
+			case listener.ch <- task:
+				log.Printf("listen_role wait delivered: project=%s role=%s task=%s listener_age=%s", projectID, role, taskID, listenerAge)
 				b.publishAdminEvent(statusEvent{
 					ProjectID: projectID,
 					TaskID:    taskID,
@@ -235,6 +296,9 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 				// Listener was busy/disappeared, rollback to queued
 				if err := b.store.UpdateStatus(projectID, taskID, StatusQueued); err != nil {
 					log.Printf("failed to rollback status for task %s: %v", taskID, err)
+				} else {
+					resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
+					log.Printf("task status transition: source=create_task.wait_listener_rollback project=%s task=%s role=%s to=%s result_present=%t result_len=%d result_read_error=%v", projectID, taskID, role, StatusQueued, resultPresent, resultLen, resultErr)
 				}
 			}
 		}
@@ -386,10 +450,12 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 		if queue := projectQueue[role]; len(queue) > 0 {
 			task := queue[0]
 
+			b.logPickAttempt(projectID, task, "listen_role."+mode, len(queue))
 			if err := b.store.UpdateStatus(projectID, task.ID, StatusPicked); err != nil {
 				b.mu.Unlock()
 				return nil, "", fmt.Errorf("failed to update status to picked: %w", err)
 			}
+			log.Printf("task status transition: source=listen_role.%s project=%s task=%s role=%s to=%s queue_len_before=%d", mode, projectID, task.ID, role, StatusPicked, len(queue))
 			b.publishAdminEvent(statusEvent{
 				ProjectID: projectID,
 				TaskID:    task.ID,
@@ -410,24 +476,35 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 
 	// Mode is wait
 	if projectListeners, ok := b.listeners[projectID]; ok {
-		if _, exists := projectListeners[role]; exists {
+		if existing, exists := projectListeners[role]; exists {
+			age := time.Since(existing.startedAt).Round(time.Millisecond)
+			log.Printf("listen_role wait duplicate: project=%s role=%s existing_age=%s existing_timeout_ms=%d", projectID, role, age, existing.timeoutMs)
 			b.mu.Unlock()
 			return nil, "", fmt.Errorf("role %q already has a listener in project %q", role, projectID)
 		}
 	} else {
-		b.listeners[projectID] = make(map[string]chan *Task)
+		b.listeners[projectID] = make(map[string]*listenerEntry)
 	}
 
-	ch := make(chan *Task, 1)
-	b.listeners[projectID][role] = ch
+	listener := &listenerEntry{
+		ch:        make(chan *Task, 1),
+		startedAt: time.Now().UTC(),
+		timeoutMs: timeoutMs,
+	}
+	b.listeners[projectID][role] = listener
+	log.Printf("listen_role wait registered: project=%s role=%s timeout_ms=%d", projectID, role, timeoutMs)
 	b.mu.Unlock()
 
+	exitReason := "unknown"
 	defer func() {
 		b.mu.Lock()
 		if projectListeners, ok := b.listeners[projectID]; ok {
-			delete(projectListeners, role)
-			if len(projectListeners) == 0 {
-				delete(b.listeners, projectID)
+			if projectListeners[role] == listener {
+				delete(projectListeners, role)
+				if len(projectListeners) == 0 {
+					delete(b.listeners, projectID)
+				}
+				log.Printf("listen_role wait cleanup: project=%s role=%s reason=%s age=%s timeout_ms=%d", projectID, role, exitReason, time.Since(listener.startedAt).Round(time.Millisecond), timeoutMs)
 			}
 		}
 		b.mu.Unlock()
@@ -439,11 +516,17 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 	}
 
 	select {
-	case task := <-ch:
+	case task := <-listener.ch:
+		exitReason = "delivered"
+		log.Printf("listen_role wait returning task: project=%s role=%s task=%s age=%s", projectID, role, task.ID, time.Since(listener.startedAt).Round(time.Millisecond))
 		return task, "picked", nil
 	case <-ctx.Done():
+		exitReason = "context_canceled"
+		log.Printf("listen_role wait context canceled: project=%s role=%s age=%s err=%v", projectID, role, time.Since(listener.startedAt).Round(time.Millisecond), ctx.Err())
 		return nil, "", ctx.Err()
 	case <-timeoutCh:
+		exitReason = "timeout"
+		log.Printf("listen_role wait timeout: project=%s role=%s age=%s timeout_ms=%d", projectID, role, time.Since(listener.startedAt).Round(time.Millisecond), timeoutMs)
 		return nil, "timeout", nil
 	}
 }
@@ -460,11 +543,18 @@ func (b *Broker) SolveTask(projectID, taskID, resultMD string) error {
 	if err != nil {
 		return fmt.Errorf("project %q not found or has no active tasks", projectID)
 	}
+	resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
+	inTasks, queuedRole, queueOccurrences := b.memoryDiagnostics(projectID, taskID)
+	log.Printf("task solve attempt: project=%s task=%s role=%s db_status=%s existing_result_present=%t existing_result_len=%d result_read_error=%v in_memory=%t queued_role=%q queued_occurrences=%d new_result_len=%d", projectID, taskID, meta.Role, meta.Status, resultPresent, resultLen, resultErr, inTasks, queuedRole, queueOccurrences, len(resultMD))
+	if meta.Status != StatusPicked {
+		log.Printf("task solve anomaly: project=%s task=%s role=%s db_status=%s expected_status=%s existing_result_present=%t existing_result_len=%d in_memory=%t queued_role=%q queued_occurrences=%d", projectID, taskID, meta.Role, meta.Status, StatusPicked, resultPresent, resultLen, inTasks, queuedRole, queueOccurrences)
+	}
 
 	if meta.Status == StatusSolved {
 		if storedResult, err := b.store.GetResult(projectID, taskID); err == nil {
 			resultMD = storedResult
 		}
+		log.Printf("task solve duplicate: project=%s task=%s role=%s stored_result_len=%d", projectID, taskID, meta.Role, len(resultMD))
 		b.cleanupInMemory(projectID, taskID, resultMD)
 		return nil
 	}
@@ -480,7 +570,8 @@ func (b *Broker) SolveTask(projectID, taskID, resultMD string) error {
 		UpdatedAt: time.Now().UTC(),
 	})
 
-	log.Printf("task solved: project=%s task=%s", projectID, taskID)
+	storedResultPresent, storedResultLen, storedResultErr := b.resultDiagnostics(projectID, taskID)
+	log.Printf("task solved: project=%s task=%s role=%s from=%s to=%s stored_result_present=%t stored_result_len=%d result_read_error=%v", projectID, taskID, meta.Role, meta.Status, StatusSolved, storedResultPresent, storedResultLen, storedResultErr)
 
 	b.cleanupInMemory(projectID, taskID, resultMD)
 	return nil
@@ -560,13 +651,16 @@ func (b *Broker) AdminUpdateStatus(projectID, taskID, newStatus string) error {
 	if err != nil {
 		return fmt.Errorf("task %q not found in project %q", taskID, projectID)
 	}
+	resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
 
 	target := TaskStatus(newStatus)
 	if target != StatusQueued && target != StatusSolved {
 		return fmt.Errorf("admin can only set status to 'queued' or 'solved'")
 	}
+	log.Printf("admin status change attempt: project=%s task=%s role=%s from=%s to=%s result_present=%t result_len=%d result_read_error=%v", projectID, taskID, meta.Role, meta.Status, target, resultPresent, resultLen, resultErr)
 
 	if meta.Status == target {
+		log.Printf("admin status change noop: project=%s task=%s role=%s status=%s result_present=%t result_len=%d", projectID, taskID, meta.Role, meta.Status, resultPresent, resultLen)
 		return nil
 	}
 
@@ -578,6 +672,7 @@ func (b *Broker) AdminUpdateStatus(projectID, taskID, newStatus string) error {
 		if err := b.store.ClearResult(projectID, taskID); err != nil {
 			return fmt.Errorf("failed to clear result: %w", err)
 		}
+		log.Printf("admin result cleared after requeue: project=%s task=%s role=%s result_present_before=%t result_len_before=%d", projectID, taskID, meta.Role, resultPresent, resultLen)
 
 		md, err := b.store.GetTaskMD(projectID, taskID)
 		if err != nil {
@@ -620,7 +715,8 @@ func (b *Broker) AdminUpdateStatus(projectID, taskID, newStatus string) error {
 		UpdatedAt: time.Now().UTC(),
 	})
 
-	log.Printf("admin status change: project=%s task=%s %s->%s", projectID, taskID, meta.Status, target)
+	storedResultPresent, storedResultLen, storedResultErr := b.resultDiagnostics(projectID, taskID)
+	log.Printf("admin status change: project=%s task=%s role=%s %s->%s result_present=%t result_len=%d result_read_error=%v", projectID, taskID, meta.Role, meta.Status, target, storedResultPresent, storedResultLen, storedResultErr)
 	return nil
 }
 
