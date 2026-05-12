@@ -72,6 +72,16 @@ For `async` mode:
 4. call `solve_task` with the same `task_id`
 5. poll again for more work when appropriate
 
+## Completion gate
+
+After `listen_role` returns a task, you must not stop, finish your turn, or report completion in chat until `solve_task` succeeds for that exact task.
+
+Before calling `solve_task`, copy `task_id` exactly from the task returned by `listen_role`. Do not invent, shorten, rewrite, or reuse a `task_id` from memory.
+
+If `solve_task` fails because the `task_id` is unknown, treat that as your argument error: re-check the task returned by `listen_role` and retry with the exact `task_id`.
+
+A chat message is not a valid final result. Only a successful `solve_task` call completes the task.
+
 ## Report format
 
 Your `solve_task` report should usually include:
@@ -84,6 +94,7 @@ Your `solve_task` report should usually include:
 ## Important rules
 
 1. Do not keep the result only in chat. Send the result through `solve_task`.
-2. Prefer minimal correct changes.
-3. Verify before reporting completion when feasible.
-4. If the selected mode is disabled by server configuration, report that clearly instead of inventing a workaround.
+2. Never end your turn after receiving a task unless `solve_task` has succeeded for that task.
+3. Prefer minimal correct changes.
+4. Verify before reporting completion when feasible.
+5. If the selected mode is disabled by server configuration, report that clearly instead of inventing a workaround.

@@ -541,7 +541,7 @@ func (b *Broker) SolveTask(projectID, taskID, resultMD string) error {
 
 	meta, err := b.store.GetStatus(projectID, taskID)
 	if err != nil {
-		return fmt.Errorf("project %q not found or has no active tasks", projectID)
+		return fmt.Errorf("solve_task received unknown task_id %q", taskID)
 	}
 	resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
 	inTasks, queuedRole, queueOccurrences := b.memoryDiagnostics(projectID, taskID)

@@ -277,7 +277,7 @@ func (s *SQLiteStore) ListTasks(projectID, role, status string, limit, offset in
 		query += " AND status = ?"
 		args = append(args, status)
 	}
-	query += " ORDER BY created_at DESC"
+	query += " ORDER BY created_at DESC, rowid DESC"
 
 	if limit > 0 {
 		query += " LIMIT ?"

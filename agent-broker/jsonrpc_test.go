@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -146,6 +147,33 @@ func TestJSONRPC_HandleToolCall(t *testing.T) {
 	res, err = handler.handleToolCall(ctx, projectID, "await_task", json.RawMessage(awaitArgsBytes))
 	if err != nil {
 		t.Fatalf("await_task failed: %v", err)
+	}
+}
+
+func TestHandleToolCall_ListTasksDefaultsToMostRecent20(t *testing.T) {
+	broker := newTestBroker(t, true, true)
+	handler := &JSONRPCHandler{broker: broker}
+	ctx := context.Background()
+	projectID := "default"
+
+	for i := 0; i < 25; i++ {
+		_, err := broker.CreateTask(projectID, "coder", fmt.Sprintf("Task %02d", i), "MD")
+		if err != nil {
+			t.Fatalf("CreateTask failed: %v", err)
+		}
+	}
+
+	res, err := handler.handleToolCall(ctx, projectID, "list_tasks", json.RawMessage(`{"role":"coder"}`))
+	if err != nil {
+		t.Fatalf("list_tasks failed: %v", err)
+	}
+	resMap := res.(map[string]any)
+	tasks := resMap["tasks"].([]StatusMetadata)
+	if len(tasks) != 20 {
+		t.Fatalf("Expected 20 tasks, got %d", len(tasks))
+	}
+	if tasks[0].Title != "Task 24" || tasks[19].Title != "Task 05" {
+		t.Fatalf("Expected most recent tasks first, got first=%q last=%q", tasks[0].Title, tasks[19].Title)
 	}
 }
 

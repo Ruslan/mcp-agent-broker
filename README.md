@@ -220,7 +220,7 @@ Timed out wait response:
 
 ### `list_tasks`
 
-Returns lightweight metadata only.
+Returns up to 20 most recent lightweight metadata records, newest first.
 
 Allowed filters:
 

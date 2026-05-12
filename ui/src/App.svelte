@@ -5,6 +5,7 @@
   import DOMPurify from 'dompurify';
 
   const PAGE_SIZE = 50;
+  const PROJECT_PARAM = 'project';
 
   let currentView = $state('tasks');
   let projects = $state([]);
@@ -18,6 +19,23 @@
   let filterStatus = $state('');
 
   let eventSource;
+
+  function readProjectFromURL() {
+    const project = new URL(window.location.href).searchParams.get(PROJECT_PARAM)?.trim();
+    return project || 'default';
+  }
+
+  function writeProjectToURL() {
+    const url = new URL(window.location.href);
+    url.searchParams.set(PROJECT_PARAM, selectedProject);
+    history.replaceState({}, '', url);
+  }
+
+  function selectProject() {
+    selectedTask = null;
+    writeProjectToURL();
+    fetchTasks(true);
+  }
 
   async function fetchProjects() {
     const res = await fetch('./api/projects');
@@ -101,6 +119,8 @@
   }
 
   onMount(() => {
+    selectedProject = readProjectFromURL();
+    writeProjectToURL();
     fetchProjects();
     fetchTasks(true);
     fetchPrompts();
@@ -141,7 +161,7 @@
       {#if currentView === 'tasks'}
         <ul>
           <li>
-            <select bind:value={selectedProject} onchange={() => fetchTasks(true)}>
+            <select bind:value={selectedProject} onchange={selectProject}>
               {#each projects as p}
                 <option value={p}>{p}</option>
               {/each}

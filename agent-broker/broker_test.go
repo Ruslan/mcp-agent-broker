@@ -215,6 +215,21 @@ func TestBroker_DuplicateSolve(t *testing.T) {
 	}
 }
 
+func TestBroker_SolveTaskUnknownIDErrorMentionsTaskIDOnly(t *testing.T) {
+	broker := newTestBroker(t, true, true)
+
+	err := broker.SolveTask(testProject, "wrong-task-id", "result")
+	if err == nil {
+		t.Fatal("Expected error for unknown task_id")
+	}
+	if !strings.Contains(err.Error(), "task_id") || !strings.Contains(err.Error(), "wrong-task-id") {
+		t.Fatalf("Expected error to identify task_id, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "project") || strings.Contains(err.Error(), testProject) {
+		t.Fatalf("Expected error not to mention project, got %q", err.Error())
+	}
+}
+
 func TestBroker_TitleValidation(t *testing.T) {
 	broker := newTestBroker(t, true, true)
 

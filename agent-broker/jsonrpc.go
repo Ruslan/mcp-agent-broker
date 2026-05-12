@@ -42,6 +42,8 @@ const (
 	ErrInvalidParams  = -32602
 	ErrInternal       = -32603
 	ErrApp            = -32000
+
+	defaultListTasksLimit = 20
 )
 
 type JSONRPCHandler struct {
@@ -241,7 +243,7 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tools = append(tools,
 			map[string]any{
 				"name":        "list_tasks",
-				"description": "Returns lightweight task metadata only. Filters allowed.",
+				"description": "Returns up to 20 most recent lightweight task metadata records. Filters allowed.",
 				"inputSchema": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -418,7 +420,7 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 		}
 		json.Unmarshal(args, &p) // ignoring error as all fields are optional
 
-		tasks, err := h.broker.ListTasks(projectID, p.Role, p.Status, 0, 0)
+		tasks, err := h.broker.ListTasks(projectID, p.Role, p.Status, defaultListTasksLimit, 0)
 		if err != nil {
 			return nil, err
 		}
