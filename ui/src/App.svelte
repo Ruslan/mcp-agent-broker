@@ -140,6 +140,23 @@
     return DOMPurify.sanitize(marked.parse(md));
   }
 
+  function closeTaskDialog() {
+    selectedTask = null;
+  }
+
+  function handleWindowKeydown(e) {
+    if (e.key === 'Escape' && selectedTask) {
+      e.preventDefault();
+      closeTaskDialog();
+    }
+  }
+
+  function handleTaskDialogClick(e) {
+    if (e.target === e.currentTarget) {
+      closeTaskDialog();
+    }
+  }
+
   function handleKeydown(e, callback) {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
@@ -147,6 +164,8 @@
     }
   }
 </script>
+
+<svelte:window onkeydown={handleWindowKeydown} />
 
 <main class="container">
   <header>
@@ -240,54 +259,60 @@
   {/if}
 
   {#if selectedTask}
-    <dialog open>
+    <dialog open onclick={handleTaskDialogClick}>
       <article class="modal-content">
         <header>
-          <a href="#close" aria-label="Close" class="close" onclick={() => selectedTask = null}></a>
+          <a href="#close" aria-label="Close" class="close" onclick={(e) => { e.preventDefault(); closeTaskDialog(); }}></a>
           {selectedTask.metadata.title}
         </header>
-        <div class="grid">
-          <div><strong>Status:</strong> <span class="status-{selectedTask.metadata.status}">{selectedTask.metadata.status}</span></div>
-          <div><strong>Role:</strong> {selectedTask.metadata.role}</div>
-          <div><strong>Updated:</strong> {formatDate(selectedTask.metadata.updated_at)}</div>
-        </div>
-
-        <div class="status-edit">
-          <label>
-            Change status:
-            <select onchange={(e) => updateStatus(selectedTask.metadata.task_id, e.target.value)}>
-              <option value="">--</option>
-              {#if selectedTask.metadata.status !== 'queued'}
-                <option value="queued">queued</option>
-              {/if}
-              {#if selectedTask.metadata.status !== 'solved'}
-                <option value="solved">solved</option>
-              {/if}
-            </select>
-          </label>
-        </div>
-
-        <h5>Task Description</h5>
-        <div class="markdown-body">{@html renderMarkdown(selectedTask.task_md)}</div>
-
-        {#if selectedTask.progress && selectedTask.progress.length > 0}
-          <h5>Progress Log</h5>
-          <div class="progress-log">
-            {#each selectedTask.progress as msg}
-              <div class="progress-entry">{msg}</div>
-            {/each}
+        <div class="task-modal-meta">
+          <div class="meta-item"><span>Status</span><strong class="status-{selectedTask.metadata.status}">{selectedTask.metadata.status}</strong></div>
+          <div class="meta-item"><span>Role</span><strong>{selectedTask.metadata.role}</strong></div>
+          <div class="meta-item"><span>Updated</span><strong>{formatDate(selectedTask.metadata.updated_at)}</strong></div>
+          <div class="status-edit">
+            <label>
+              Change status
+              <select onchange={(e) => updateStatus(selectedTask.metadata.task_id, e.target.value)}>
+                <option value="">--</option>
+                {#if selectedTask.metadata.status !== 'queued'}
+                  <option value="queued">queued</option>
+                {/if}
+                {#if selectedTask.metadata.status !== 'solved'}
+                  <option value="solved">solved</option>
+                {/if}
+              </select>
+            </label>
           </div>
-        {/if}
+        </div>
+        <div class="task-modal-grid">
+          <section class="task-modal-panel">
+            <h5>Task</h5>
+            <div class="markdown-body">{@html renderMarkdown(selectedTask.task_md)}</div>
 
-        {#if selectedTask.result_md}
-          <h5>Result</h5>
-          <div class="markdown-body">{@html renderMarkdown(selectedTask.result_md)}</div>
-        {/if}
+            {#if selectedTask.progress && selectedTask.progress.length > 0}
+              <h5 class="progress-heading">Progress Log</h5>
+              <div class="progress-log">
+                {#each selectedTask.progress as msg}
+                  <div class="progress-entry">{msg}</div>
+                {/each}
+              </div>
+            {/if}
+          </section>
+
+          <section class="task-modal-panel result-panel">
+            <h5>Result</h5>
+            {#if selectedTask.result_md}
+              <div class="markdown-body">{@html renderMarkdown(selectedTask.result_md)}</div>
+            {:else}
+              <div class="empty-result">No result yet.</div>
+            {/if}
+          </section>
+        </div>
 
         <footer>
           <div class="modal-footer">
             <button class="outline contrast" onclick={() => deleteTask(selectedTask.metadata.task_id)}>Delete Task</button>
-            <button class="secondary" onclick={() => selectedTask = null}>Close</button>
+            <button class="secondary" onclick={closeTaskDialog}>Close</button>
           </div>
         </footer>
       </article>
