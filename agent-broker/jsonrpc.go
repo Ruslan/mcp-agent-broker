@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -131,6 +132,9 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var result any
 	var rpcErr *RPCError
+	var toolName string
+	var toolStartedAt time.Time
+	var requeueOnWriteFailure string
 
 	switch req.Method {
 	case "initialize":
@@ -303,17 +307,20 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			rpcErr = &RPCError{Code: ErrInvalidParams, Message: "Invalid params"}
 		} else {
-			start := time.Now()
+			toolName = params.Name
+			toolStartedAt = time.Now()
 			res, err := h.handleToolCall(ctx, projectID, params.Name, params.Arguments)
-			elapsed := time.Since(start)
 			if err != nil {
+				elapsed := time.Since(toolStartedAt)
 				log.Printf("tool=%s project=%s err=%q elapsed=%s", params.Name, projectID, err.Error(), elapsed.Round(time.Millisecond))
 				rpcErr = &RPCError{Code: ErrApp, Message: err.Error()}
 			} else {
-				log.Printf("tool=%s project=%s ok elapsed=%s", params.Name, projectID, elapsed.Round(time.Millisecond))
 				resJSON, _ := json.Marshal(res)
 				result = map[string]any{
 					"content": []any{map[string]any{"type": "text", "text": string(resJSON)}},
+				}
+				if params.Name == "listen_role" {
+					requeueOnWriteFailure = listenRoleTaskID(res)
 				}
 			}
 		}
@@ -323,10 +330,40 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if rpcErr != nil {
-		h.sendError(w, req.ID, rpcErr.Code, rpcErr.Message)
+		if err := h.sendError(w, req.ID, rpcErr.Code, rpcErr.Message); err != nil {
+			log.Printf("jsonrpc error response write failed: method=%s project=%s err=%v", req.Method, projectID, err)
+		}
 		return
 	}
-	h.sendResult(w, req.ID, result)
+	if err := h.sendResult(w, req.ID, result); err != nil {
+		if requeueOnWriteFailure != "" {
+			if requeueErr := h.broker.RequeuePickedTask(projectID, requeueOnWriteFailure, "listen_role.response_write_failed"); requeueErr != nil {
+				log.Printf("failed to requeue task after response write failure: project=%s task=%s err=%v", projectID, requeueOnWriteFailure, requeueErr)
+			}
+		}
+		if toolName != "" {
+			log.Printf("tool=%s project=%s write_err=%q elapsed=%s", toolName, projectID, err.Error(), time.Since(toolStartedAt).Round(time.Millisecond))
+		} else {
+			log.Printf("jsonrpc result response write failed: method=%s project=%s err=%v", req.Method, projectID, err)
+		}
+		return
+	}
+	if toolName != "" {
+		log.Printf("tool=%s project=%s ok elapsed=%s", toolName, projectID, time.Since(toolStartedAt).Round(time.Millisecond))
+	}
+}
+
+func listenRoleTaskID(res any) string {
+	m, ok := res.(map[string]any)
+	if !ok {
+		return ""
+	}
+	task, ok := m["task"].(map[string]any)
+	if !ok || task == nil {
+		return ""
+	}
+	taskID, _ := task["task_id"].(string)
+	return taskID
 }
 
 func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name string, args json.RawMessage) (any, error) {
@@ -370,6 +407,7 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 		}
 		if status == string(StatusSolved) {
 			resp["result_md"] = res
+			_, _ = h.broker.IncrementResultViewCount(projectID, p.TaskID)
 		}
 		if len(progress) > 0 {
 			resp["progress"] = progress
@@ -465,6 +503,7 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 			res, err := h.broker.GetTaskResult(projectID, p.TaskID)
 			if err == nil {
 				resp["result_md"] = res
+				_, _ = h.broker.IncrementResultViewCount(projectID, p.TaskID)
 			}
 		}
 
@@ -504,20 +543,34 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 	}
 }
 
-func (h *JSONRPCHandler) sendError(w http.ResponseWriter, id json.RawMessage, code int, message string) {
+func (h *JSONRPCHandler) sendError(w http.ResponseWriter, id json.RawMessage, code int, message string) error {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(Response{
+	if err := json.NewEncoder(w).Encode(Response{
 		JSONRPC: "2.0",
 		Error:   &RPCError{Code: code, Message: message},
 		ID:      id,
-	})
+	}); err != nil {
+		return err
+	}
+	return flushResponse(w)
 }
 
-func (h *JSONRPCHandler) sendResult(w http.ResponseWriter, id json.RawMessage, result any) {
+func (h *JSONRPCHandler) sendResult(w http.ResponseWriter, id json.RawMessage, result any) error {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(Response{
+	if err := json.NewEncoder(w).Encode(Response{
 		JSONRPC: "2.0",
 		Result:  result,
 		ID:      id,
-	})
+	}); err != nil {
+		return err
+	}
+	return flushResponse(w)
+}
+
+func flushResponse(w http.ResponseWriter) error {
+	err := http.NewResponseController(w).Flush()
+	if err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	return nil
 }

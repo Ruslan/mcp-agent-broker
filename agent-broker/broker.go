@@ -36,13 +36,14 @@ const (
 
 // StatusMetadata represents the JSON shape of status.json.
 type StatusMetadata struct {
-	TaskID    string     `json:"task_id"`
-	ProjectID string     `json:"project_id"`
-	Role      string     `json:"role"`
-	Title     string     `json:"title"`
-	Status    TaskStatus `json:"status"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	TaskID          string     `json:"task_id"`
+	ProjectID       string     `json:"project_id"`
+	Role            string     `json:"role"`
+	Title           string     `json:"title"`
+	Status          TaskStatus `json:"status"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	ResultViewCount int        `json:"result_view_count"`
 }
 
 // Task represents a unit of work assigned to a role.
@@ -58,6 +59,7 @@ type Task struct {
 
 type listenerEntry struct {
 	ch        chan *Task
+	ctx       context.Context
 	startedAt time.Time
 	timeoutMs int
 }
@@ -220,6 +222,41 @@ func (b *Broker) logPickAttempt(projectID string, task *Task, source string, que
 	log.Printf("task pick attempt: source=%s project=%s task=%s role=%s queue_len=%d db_status=%s result_present=%t result_len=%d", source, projectID, task.ID, task.Role, queueLen, meta.Status, resultPresent, resultLen)
 }
 
+func (b *Broker) deleteListenerLocked(projectID, role string, listener *listenerEntry) bool {
+	projectListeners, ok := b.listeners[projectID]
+	if !ok || projectListeners[role] != listener {
+		return false
+	}
+	delete(projectListeners, role)
+	if len(projectListeners) == 0 {
+		delete(b.listeners, projectID)
+	}
+	return true
+}
+
+func (b *Broker) enqueueUniqueLocked(projectID, role string, task *Task) bool {
+	if b.asyncQueue[projectID] == nil {
+		b.asyncQueue[projectID] = make(map[string][]*Task)
+	}
+	for _, queued := range b.asyncQueue[projectID][role] {
+		if queued.ID == task.ID {
+			return false
+		}
+	}
+	b.asyncQueue[projectID][role] = append(b.asyncQueue[projectID][role], task)
+	return true
+}
+
+func (b *Broker) requeueDeliveredTask(projectID string, listener *listenerEntry, source string) {
+	select {
+	case task := <-listener.ch:
+		if err := b.RequeuePickedTask(projectID, task.ID, source); err != nil {
+			log.Printf("failed to requeue delivered task after listener exit: source=%s project=%s task=%s err=%v", source, projectID, task.ID, err)
+		}
+	default:
+	}
+}
+
 // CreateTask enqueues a task for a role and returns immediately with a generated ID.
 func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, error) {
 	if role == "" || title == "" || taskMD == "" {
@@ -266,48 +303,55 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 	// If a listener is waiting, deliver directly
 	if projectListeners, ok := b.listeners[projectID]; ok {
 		if listener, hasListener := projectListeners[role]; hasListener {
-			listenerAge := time.Since(listener.startedAt).Round(time.Millisecond)
-			b.logPickAttempt(projectID, task, "create_task.wait_listener", 0)
-			if err := b.store.UpdateStatus(projectID, taskID, StatusPicked); err != nil {
-				delete(b.tasks[projectID], taskID)
-				b.store.DeleteTask(projectID, taskID)
-				return "", fmt.Errorf("failed to update status to picked: %w", err)
-			}
-			log.Printf("task status transition: source=create_task.wait_listener project=%s task=%s role=%s to=%s listener_age=%s listener_timeout_ms=%d", projectID, taskID, role, StatusPicked, listenerAge, listener.timeoutMs)
+			if listener.ctx != nil && listener.ctx.Err() != nil {
+				listenerAge := time.Since(listener.startedAt).Round(time.Millisecond)
+				b.deleteListenerLocked(projectID, role, listener)
+				log.Printf("listen_role wait stale listener skipped: project=%s role=%s age=%s err=%v", projectID, role, listenerAge, listener.ctx.Err())
+			} else {
+				listenerAge := time.Since(listener.startedAt).Round(time.Millisecond)
+				b.logPickAttempt(projectID, task, "create_task.wait_listener", 0)
+				if err := b.store.UpdateStatus(projectID, taskID, StatusPicked); err != nil {
+					delete(b.tasks[projectID], taskID)
+					b.store.DeleteTask(projectID, taskID)
+					return "", fmt.Errorf("failed to update status to picked: %w", err)
+				}
+				log.Printf("task status transition: source=create_task.wait_listener project=%s task=%s role=%s to=%s listener_age=%s listener_timeout_ms=%d", projectID, taskID, role, StatusPicked, listenerAge, listener.timeoutMs)
 
-			// Wait-mode listeners are one-shot. Remove the listener before
-			// delivering so subsequent tasks are queued for the next listen call.
-			delete(projectListeners, role)
-			if len(projectListeners) == 0 {
-				delete(b.listeners, projectID)
-			}
+				// Wait-mode listeners are one-shot. Remove the listener before
+				// delivering so subsequent tasks are queued for the next listen call.
+				b.deleteListenerLocked(projectID, role, listener)
 
-			select {
-			case listener.ch <- task:
-				log.Printf("listen_role wait delivered: project=%s role=%s task=%s listener_age=%s", projectID, role, taskID, listenerAge)
-				b.publishAdminEvent(statusEvent{
-					ProjectID: projectID,
-					TaskID:    taskID,
-					Status:    StatusPicked,
-					UpdatedAt: time.Now().UTC(),
-				})
-				return taskID, nil
-			default:
-				// Listener was busy/disappeared, rollback to queued
-				if err := b.store.UpdateStatus(projectID, taskID, StatusQueued); err != nil {
-					log.Printf("failed to rollback status for task %s: %v", taskID, err)
-				} else {
-					resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
-					log.Printf("task status transition: source=create_task.wait_listener_rollback project=%s task=%s role=%s to=%s result_present=%t result_len=%d result_read_error=%v", projectID, taskID, role, StatusQueued, resultPresent, resultLen, resultErr)
+				select {
+				case <-listener.ctx.Done():
+					if err := b.store.UpdateStatus(projectID, taskID, StatusQueued); err != nil {
+						log.Printf("failed to rollback status for canceled listener task %s: %v", taskID, err)
+					} else {
+						resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
+						log.Printf("task status transition: source=create_task.wait_listener_canceled project=%s task=%s role=%s to=%s result_present=%t result_len=%d result_read_error=%v", projectID, taskID, role, StatusQueued, resultPresent, resultLen, resultErr)
+					}
+				case listener.ch <- task:
+					log.Printf("listen_role wait delivered: project=%s role=%s task=%s listener_age=%s", projectID, role, taskID, listenerAge)
+					b.publishAdminEvent(statusEvent{
+						ProjectID: projectID,
+						TaskID:    taskID,
+						Status:    StatusPicked,
+						UpdatedAt: time.Now().UTC(),
+					})
+					return taskID, nil
+				default:
+					// Listener was busy/disappeared, rollback to queued
+					if err := b.store.UpdateStatus(projectID, taskID, StatusQueued); err != nil {
+						log.Printf("failed to rollback status for task %s: %v", taskID, err)
+					} else {
+						resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
+						log.Printf("task status transition: source=create_task.wait_listener_rollback project=%s task=%s role=%s to=%s result_present=%t result_len=%d result_read_error=%v", projectID, taskID, role, StatusQueued, resultPresent, resultLen, resultErr)
+					}
 				}
 			}
 		}
 	}
 
-	if b.asyncQueue[projectID] == nil {
-		b.asyncQueue[projectID] = make(map[string][]*Task)
-	}
-	b.asyncQueue[projectID][role] = append(b.asyncQueue[projectID][role], task)
+	b.enqueueUniqueLocked(projectID, role, task)
 
 	b.publishAdminEvent(statusEvent{
 		ProjectID: projectID,
@@ -447,8 +491,20 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 	b.mu.Lock()
 	// Check for queued async work first
 	if projectQueue, ok := b.asyncQueue[projectID]; ok {
-		if queue := projectQueue[role]; len(queue) > 0 {
+		for queue := projectQueue[role]; len(queue) > 0; queue = projectQueue[role] {
 			task := queue[0]
+			projectQueue[role] = queue[1:]
+
+			meta, metaErr := b.store.GetStatus(projectID, task.ID)
+			resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, task.ID)
+			if metaErr != nil || meta.Status != StatusQueued || resultPresent || resultErr != nil {
+				status := ""
+				if meta != nil {
+					status = string(meta.Status)
+				}
+				log.Printf("task pick skipped: source=listen_role.%s project=%s task=%s role=%s queue_len_before=%d db_status=%s status_read_error=%v result_present=%t result_len=%d result_read_error=%v", mode, projectID, task.ID, role, len(queue), status, metaErr, resultPresent, resultLen, resultErr)
+				continue
+			}
 
 			b.logPickAttempt(projectID, task, "listen_role."+mode, len(queue))
 			if err := b.store.UpdateStatus(projectID, task.ID, StatusPicked); err != nil {
@@ -463,7 +519,6 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 				UpdatedAt: time.Now().UTC(),
 			})
 
-			projectQueue[role] = queue[1:]
 			b.mu.Unlock()
 			return task, "picked", nil
 		}
@@ -486,8 +541,18 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 		b.listeners[projectID] = make(map[string]*listenerEntry)
 	}
 
+	listenerCtx := ctx
+	var cancelListener context.CancelFunc
+	if timeoutMs > 0 {
+		listenerCtx, cancelListener = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
+	}
+	if cancelListener != nil {
+		defer cancelListener()
+	}
+
 	listener := &listenerEntry{
 		ch:        make(chan *Task, 1),
+		ctx:       listenerCtx,
 		startedAt: time.Now().UTC(),
 		timeoutMs: timeoutMs,
 	}
@@ -498,21 +563,15 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 	exitReason := "unknown"
 	defer func() {
 		b.mu.Lock()
-		if projectListeners, ok := b.listeners[projectID]; ok {
-			if projectListeners[role] == listener {
-				delete(projectListeners, role)
-				if len(projectListeners) == 0 {
-					delete(b.listeners, projectID)
-				}
-				log.Printf("listen_role wait cleanup: project=%s role=%s reason=%s age=%s timeout_ms=%d", projectID, role, exitReason, time.Since(listener.startedAt).Round(time.Millisecond), timeoutMs)
-			}
+		if b.deleteListenerLocked(projectID, role, listener) {
+			log.Printf("listen_role wait cleanup: project=%s role=%s reason=%s age=%s timeout_ms=%d", projectID, role, exitReason, time.Since(listener.startedAt).Round(time.Millisecond), timeoutMs)
 		}
 		b.mu.Unlock()
 	}()
 
-	var timeoutCh <-chan time.Time
+	var timeoutCh <-chan struct{}
 	if timeoutMs > 0 {
-		timeoutCh = time.After(time.Duration(timeoutMs) * time.Millisecond)
+		timeoutCh = listenerCtx.Done()
 	}
 
 	select {
@@ -522,10 +581,18 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 		return task, "picked", nil
 	case <-ctx.Done():
 		exitReason = "context_canceled"
+		b.requeueDeliveredTask(projectID, listener, "listen_role.context_canceled_after_delivery")
 		log.Printf("listen_role wait context canceled: project=%s role=%s age=%s err=%v", projectID, role, time.Since(listener.startedAt).Round(time.Millisecond), ctx.Err())
 		return nil, "", ctx.Err()
 	case <-timeoutCh:
+		if ctx.Err() != nil {
+			exitReason = "context_canceled"
+			b.requeueDeliveredTask(projectID, listener, "listen_role.context_canceled_after_delivery")
+			log.Printf("listen_role wait context canceled: project=%s role=%s age=%s err=%v", projectID, role, time.Since(listener.startedAt).Round(time.Millisecond), ctx.Err())
+			return nil, "", ctx.Err()
+		}
 		exitReason = "timeout"
+		b.requeueDeliveredTask(projectID, listener, "listen_role.timeout_after_delivery")
 		log.Printf("listen_role wait timeout: project=%s role=%s age=%s timeout_ms=%d", projectID, role, time.Since(listener.startedAt).Round(time.Millisecond), timeoutMs)
 		return nil, "timeout", nil
 	}
@@ -613,6 +680,10 @@ func (b *Broker) GetTaskStatus(projectID, taskID string) (*StatusMetadata, error
 	return b.store.GetStatus(projectID, taskID)
 }
 
+func (b *Broker) IncrementResultViewCount(projectID, taskID string) (int, error) {
+	return b.store.IncrementResultViewCount(projectID, taskID)
+}
+
 // GetTaskResult returns the result for a task if available.
 func (b *Broker) GetTaskResult(projectID, taskID string) (string, error) {
 	if !isSafeID(taskID) {
@@ -637,6 +708,83 @@ func (b *Broker) ListTasks(projectID, role, status string, limit, offset int) ([
 // CountTasks returns the total number of tasks matching the filters.
 func (b *Broker) CountTasks(projectID, role, status string) (int, error) {
 	return b.store.CountTasks(projectID, role, status)
+}
+
+// RequeuePickedTask returns a delivered task back to the queue when delivery to
+// the worker failed before the broker could rely on the worker processing it.
+func (b *Broker) RequeuePickedTask(projectID, taskID, source string) error {
+	if !isSafeID(taskID) {
+		return fmt.Errorf("invalid task_id")
+	}
+	if source == "" {
+		source = "unknown"
+	}
+
+	meta, err := b.store.GetStatus(projectID, taskID)
+	if err != nil {
+		return err
+	}
+	resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
+	if meta.Status != StatusPicked {
+		log.Printf("task requeue skipped: source=%s project=%s task=%s role=%s status=%s result_present=%t result_len=%d result_read_error=%v", source, projectID, taskID, meta.Role, meta.Status, resultPresent, resultLen, resultErr)
+		return nil
+	}
+	if resultErr != nil {
+		return fmt.Errorf("failed to inspect result before requeue: %w", resultErr)
+	}
+	if resultPresent {
+		log.Printf("task requeue skipped: source=%s project=%s task=%s role=%s status=%s result_present=%t result_len=%d", source, projectID, taskID, meta.Role, meta.Status, resultPresent, resultLen)
+		return nil
+	}
+
+	md, err := b.store.GetTaskMD(projectID, taskID)
+	if err != nil {
+		return fmt.Errorf("failed to reload task markdown: %w", err)
+	}
+	updated, err := b.store.UpdateStatusIfCurrent(projectID, taskID, StatusPicked, StatusQueued)
+	if err != nil {
+		return err
+	}
+	if !updated {
+		latest, latestErr := b.store.GetStatus(projectID, taskID)
+		if latestErr != nil {
+			return latestErr
+		}
+		log.Printf("task requeue skipped: source=%s project=%s task=%s role=%s status_changed_to=%s", source, projectID, taskID, latest.Role, latest.Status)
+		return nil
+	}
+
+	b.mu.Lock()
+	if b.tasks[projectID] == nil {
+		b.tasks[projectID] = make(map[string]*Task)
+	}
+	task, exists := b.tasks[projectID][taskID]
+	if !exists {
+		task = &Task{
+			ID:        taskID,
+			ProjectID: projectID,
+			Role:      meta.Role,
+			Title:     meta.Title,
+			MD:        md,
+			done:      make(chan string, 1),
+			progress:  make(chan string, 32),
+		}
+		b.tasks[projectID][taskID] = task
+	} else if task.MD == "" {
+		task.MD = md
+	}
+	enqueued := b.enqueueUniqueLocked(projectID, meta.Role, task)
+	b.mu.Unlock()
+
+	b.publishAdminEvent(statusEvent{
+		ProjectID: projectID,
+		TaskID:    taskID,
+		Status:    StatusQueued,
+		UpdatedAt: time.Now().UTC(),
+	})
+
+	log.Printf("task requeued: source=%s project=%s task=%s role=%s from=%s to=%s enqueued=%t", source, projectID, taskID, meta.Role, meta.Status, StatusQueued, enqueued)
+	return nil
 }
 
 // AdminUpdateStatus allows admins to manually reset a task status (e.g. unstick a hanging task).
@@ -699,10 +847,7 @@ func (b *Broker) AdminUpdateStatus(projectID, taskID, newStatus string) error {
 			task.MD = md
 		}
 
-		if b.asyncQueue[projectID] == nil {
-			b.asyncQueue[projectID] = make(map[string][]*Task)
-		}
-		b.asyncQueue[projectID][meta.Role] = append(b.asyncQueue[projectID][meta.Role], task)
+		b.enqueueUniqueLocked(projectID, meta.Role, task)
 		b.mu.Unlock()
 	} else {
 		b.cleanupInMemory(projectID, taskID, "")

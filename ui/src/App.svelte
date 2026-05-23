@@ -163,6 +163,16 @@
       callback();
     }
   }
+
+  async function copyTaskID(e, taskID) {
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(taskID);
+    } catch {
+      // ignore clipboard errors in unsupported contexts
+    }
+  }
 </script>
 
 <svelte:window onkeydown={handleWindowKeydown} />
@@ -212,6 +222,7 @@
         <div>Title</div>
         <div>Role</div>
         <div>Status</div>
+        <div>Created</div>
         <div>Updated</div>
         <div>Task ID</div>
       </div>
@@ -223,9 +234,20 @@
              onkeydown={(e) => handleKeydown(e, () => showTask(task.task_id))}>
           <div><strong>{task.title}</strong></div>
           <div><kbd>{task.role}</kbd></div>
-          <div class="status-{task.status}">{task.status}</div>
+          <div class="status-{task.status}">
+            {task.status}
+            {#if task.status === 'solved'}
+              <span class="row-view-count row-view-{task.result_view_count === 0 ? '0' : task.result_view_count === 1 ? '1' : 'many'}">
+                {task.result_view_count === 0 ? '0' : task.result_view_count === 1 ? '1' : '1+'}
+              </span>
+            {/if}
+          </div>
+          <div>{formatDate(task.created_at)}</div>
           <div>{formatDate(task.updated_at)}</div>
-          <div><code>{task.task_id.slice(0,8)}...</code></div>
+          <div class="task-id-cell">
+            <code>{task.task_id.slice(0, 8)}...</code>
+            <button class="copy-id-btn" onclick={(e) => copyTaskID(e, task.task_id)} aria-label="Copy full task id">Copy</button>
+          </div>
         </div>
       {/each}
       {#if tasks.length < totalTasks}
@@ -264,11 +286,19 @@
         <header>
           <a href="#close" aria-label="Close" class="close" onclick={(e) => { e.preventDefault(); closeTaskDialog(); }}></a>
           {selectedTask.metadata.title}
+          <div class="task-id-full-line"><code>{selectedTask.metadata.task_id}</code></div>
         </header>
         <div class="task-modal-meta">
           <div class="meta-item"><span>Status</span><strong class="status-{selectedTask.metadata.status}">{selectedTask.metadata.status}</strong></div>
           <div class="meta-item"><span>Role</span><strong>{selectedTask.metadata.role}</strong></div>
+          <div class="meta-item"><span>Created</span><strong>{formatDate(selectedTask.metadata.created_at)}</strong></div>
           <div class="meta-item"><span>Updated</span><strong>{formatDate(selectedTask.metadata.updated_at)}</strong></div>
+          <div class="meta-item">
+            <span>Views</span>
+            <strong class="view-count {selectedTask.metadata.result_view_count === 0 && selectedTask.metadata.status === 'solved' ? 'view-zero-solved' : selectedTask.metadata.result_view_count >= 1 ? 'view-positive' : 'view-zero'}">
+              {selectedTask.metadata.result_view_count === 0 ? '0' : selectedTask.metadata.result_view_count === 1 ? '1' : '1+'}
+            </strong>
+          </div>
           <div class="status-edit">
             <label>
               Change status

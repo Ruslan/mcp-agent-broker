@@ -31,6 +31,8 @@ type Store interface {
 	InsertTask(projectID, taskID, role, title, taskMD string) error
 	// UpdateStatus changes the status of an existing task.
 	UpdateStatus(projectID, taskID string, status TaskStatus) error
+	// UpdateStatusIfCurrent changes status only if the task is still in the expected status.
+	UpdateStatusIfCurrent(projectID, taskID string, current, next TaskStatus) (bool, error)
 	// SaveResult atomically stores the result and sets status=solved.
 	SaveResult(projectID, taskID, resultMD string) error
 	// ClearResult clears the result_md field (used when admin resets task to queued).
@@ -42,6 +44,7 @@ type Store interface {
 	// GetProgress retrieves all progress messages for a task.
 	GetProgress(projectID, taskID string) ([]string, error)
 
+	IncrementResultViewCount(projectID, taskID string) (int, error)
 	GetStatus(projectID, taskID string) (*StatusMetadata, error)
 	GetTaskMD(projectID, taskID string) (string, error)
 	GetResult(projectID, taskID string) (string, error)
@@ -105,9 +108,13 @@ func sqliteMigrate(db *sql.DB) error {
 			FOREIGN KEY (project_id, task_id) REFERENCES tasks (project_id, task_id) ON DELETE CASCADE
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_progress_task ON task_progress (project_id, task_id)`,
+		`ALTER TABLE tasks ADD COLUMN result_view_count INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") || strings.Contains(err.Error(), "already exists") {
+				continue
+			}
 			return fmt.Errorf("migration failed: %w", err)
 		}
 	}
@@ -144,6 +151,19 @@ func (s *SQLiteStore) UpdateStatus(projectID, taskID string, status TaskStatus) 
 		return fmt.Errorf("task %q not found in project %q", taskID, projectID)
 	}
 	return nil
+}
+
+func (s *SQLiteStore) UpdateStatusIfCurrent(projectID, taskID string, current, next TaskStatus) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.db.Exec(
+		`UPDATE tasks SET status = ?, updated_at = ? WHERE project_id = ? AND task_id = ? AND status = ?`,
+		string(next), now, projectID, taskID, string(current),
+	)
+	if err != nil {
+		return false, fmt.Errorf("failed to update status: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func (s *SQLiteStore) SaveResult(projectID, taskID, resultMD string) error {
@@ -212,15 +232,31 @@ func (s *SQLiteStore) GetProgress(projectID, taskID string) ([]string, error) {
 	return progress, rows.Err()
 }
 
+func (s *SQLiteStore) IncrementResultViewCount(projectID, taskID string) (int, error) {
+	_, err := s.db.Exec(
+		`UPDATE tasks SET result_view_count = result_view_count + 1 WHERE project_id = ? AND task_id = ?`,
+		projectID, taskID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to increment result_view_count: %w", err)
+	}
+	var count int
+	s.db.QueryRow(
+		`SELECT result_view_count FROM tasks WHERE project_id = ? AND task_id = ?`,
+		projectID, taskID,
+	).Scan(&count)
+	return count, nil
+}
+
 func (s *SQLiteStore) GetStatus(projectID, taskID string) (*StatusMetadata, error) {
 	row := s.db.QueryRow(
-		`SELECT project_id, task_id, role, title, status, created_at, updated_at
+		`SELECT project_id, task_id, role, title, status, created_at, updated_at, result_view_count
 		 FROM tasks WHERE project_id = ? AND task_id = ?`,
 		projectID, taskID,
 	)
 	var m StatusMetadata
 	var createdAt, updatedAt string
-	err := row.Scan(&m.ProjectID, &m.TaskID, &m.Role, &m.Title, &m.Status, &createdAt, &updatedAt)
+	err := row.Scan(&m.ProjectID, &m.TaskID, &m.Role, &m.Title, &m.Status, &createdAt, &updatedAt, &m.ResultViewCount)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("task %q not found in project %q", taskID, projectID)
 	}
@@ -266,7 +302,7 @@ func (s *SQLiteStore) GetResult(projectID, taskID string) (string, error) {
 }
 
 func (s *SQLiteStore) ListTasks(projectID, role, status string, limit, offset int) ([]StatusMetadata, error) {
-	query := `SELECT project_id, task_id, role, title, status, created_at, updated_at
+	query := `SELECT project_id, task_id, role, title, status, created_at, updated_at, result_view_count
 	          FROM tasks WHERE project_id = ?`
 	args := []any{projectID}
 	if role != "" {
@@ -300,7 +336,7 @@ func (s *SQLiteStore) ListTasks(projectID, role, status string, limit, offset in
 	for rows.Next() {
 		var m StatusMetadata
 		var createdAt, updatedAt string
-		if err := rows.Scan(&m.ProjectID, &m.TaskID, &m.Role, &m.Title, &m.Status, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&m.ProjectID, &m.TaskID, &m.Role, &m.Title, &m.Status, &createdAt, &updatedAt, &m.ResultViewCount); err != nil {
 			return nil, fmt.Errorf("failed to scan task row: %w", err)
 		}
 		m.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)

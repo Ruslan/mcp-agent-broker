@@ -8,7 +8,25 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
+
+type failingResponseWriter struct {
+	header http.Header
+	code   int
+}
+
+func (w *failingResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *failingResponseWriter) WriteHeader(code int) {
+	w.code = code
+}
+
+func (w *failingResponseWriter) Write([]byte) (int, error) {
+	return 0, fmt.Errorf("forced write failure")
+}
 
 func TestJSONRPC_ServeHTTP(t *testing.T) {
 	broker := newTestBroker(t, true, true)
@@ -226,5 +244,45 @@ func TestJSONRPC_ServeHTTP_ToolCalls(t *testing.T) {
 				t.Errorf("Expected status code 200, got %d", rr.Code)
 			}
 		})
+	}
+}
+
+func TestJSONRPC_ListenRoleRequeuesOnResponseWriteFailure(t *testing.T) {
+	broker := newTestBroker(t, true, true)
+	handler := &JSONRPCHandler{broker: broker}
+
+	req := httptest.NewRequest(http.MethodPost, "/rpc", bytes.NewReader([]byte(`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"listen_role","arguments":{"role":"coder","mode":"wait","timeout_ms":5000}},"id":1}`)))
+	w := &failingResponseWriter{header: make(http.Header)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(w, req)
+	}()
+
+	taskID, err := broker.CreateTask(testProject, "coder", "Title", "MD")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("listen_role request did not finish after task delivery")
+	}
+
+	meta, err := broker.GetTaskStatus(testProject, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Status != StatusQueued {
+		t.Fatalf("Expected task to be requeued after response write failure, got %s", meta.Status)
+	}
+
+	task, status, err := broker.ListenRole(context.Background(), testProject, "coder", "poll", 0)
+	if err != nil || task == nil || status != "picked" {
+		t.Fatalf("Expected requeued task to be picked, got task=%v status=%s err=%v", task, status, err)
+	}
+	if task.ID != taskID {
+		t.Fatalf("Expected task %s, got %s", taskID, task.ID)
 	}
 }
