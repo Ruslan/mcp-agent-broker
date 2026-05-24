@@ -2,6 +2,67 @@
 
 MCP/JSON-RPC broker for delegating tasks between AI agent roles.
 
+## Integrations
+
+The broker exposes a single MCP / JSON-RPC endpoint and can be used from different orchestrators and coding agents.
+
+### Claude Code
+
+```bash
+claude mcp add --transport http agent-broker \
+  "http://localhost:9197/rpc"
+```
+
+Or in `.mcp.json` at the project root:
+
+```json
+{
+  "mcpServers": {
+    "agent-broker": {
+      "type": "http",
+      "url": "http://localhost:9197/rpc"
+    }
+  }
+}
+```
+
+### Gemini CLI
+
+`.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "agent-broker": {
+      "httpUrl": "http://localhost:9197/rpc"
+    }
+  }
+}
+```
+
+### OpenCode
+
+`.opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "agent-broker": {
+      "type": "remote",
+      "enabled": true,
+      "url": "http://localhost:9197/rpc"
+    }
+  }
+}
+```
+
+### Pi Agent
+
+Pi does not currently support MCP directly, but this repository includes an experimental extension in `extensions/pi/broker-queue/` that connects Pi to the broker queue workflow through the MCP endpoint without stuffing broker protocol details into the main chat context. The Pi extension is currently being tested.
+
+For multi-project usage, send `X-Project-Id` on requests so task queues stay isolated per project.
+
 The current API is based on a small task lifecycle:
 
 1. `create_task`
