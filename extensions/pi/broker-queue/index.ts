@@ -12,6 +12,52 @@ type ActiveTask = {
   instructions: InstructionKind;
 };
 
+function firstPickedTask(payload: any): { taskId: string; taskMd?: string; role?: string } | null {
+  const list = payload?.tasks ?? payload?.items ?? payload?.data ?? payload;
+  if (!Array.isArray(list) || list.length === 0) return null;
+  const t = list[0];
+  const taskId = t?.task_id ?? t?.id;
+  if (!taskId) return null;
+  return {
+    taskId,
+    taskMd: t?.task_md ?? t?.description,
+    role: t?.role,
+  };
+}
+
+function taskMdFromDetails(payload: any): string {
+  return payload?.task_md ?? payload?.task?.task_md ?? payload?.description ?? payload?.task?.description ?? "";
+}
+
+function isAbortError(e: any): boolean {
+  return e?.name === "AbortError";
+}
+
+function abortError(): Error {
+  const e = new Error("Aborted");
+  e.name = "AbortError";
+  return e;
+}
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError());
+      return;
+    }
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   let activeTask: ActiveTask | null = null;
   let waitLoopRunning = false;
@@ -84,13 +130,16 @@ export default function (pi: ExtensionAPI) {
     stopRequested = false;
     notify(`Started wait loop for role: ${role} (${instructions})`, "info");
 
+    let retryDelayMs = 1000;
+    const maxRetryDelayMs = 60000;
+
     try {
       const broker = await brokerReady;
-      await broker.ensureInitialized();
 
       while (!stopRequested && !activeTask) {
         try {
           waitAbort = new AbortController();
+          await broker.ensureInitialized(waitAbort.signal);
           const decoded = await broker.listenRole(role, "wait", waitAbort.signal);
           const task = extractTask(decoded);
 
@@ -102,11 +151,22 @@ export default function (pi: ExtensionAPI) {
           activeTask = { ...task, instructions };
           await publishTask(activeTask);
           notify(`Task received: ${task.taskId}`, "info");
+          retryDelayMs = 1000;
           return;
         } catch (e: any) {
           if (stopRequested) return;
-          if (e?.name === "AbortError") return;
-          notify(`Wait call ended (${e?.message || e}); retrying`, "warning");
+          if (isAbortError(e)) return;
+          const delaySec = Math.ceil(retryDelayMs / 1000);
+          notify(`Wait call ended (${e?.message || e}); retry in ${delaySec}s`, "warning");
+
+          waitAbort = new AbortController();
+          try {
+            await abortableSleep(retryDelayMs, waitAbort.signal);
+          } catch (sleepError: any) {
+            if (stopRequested || isAbortError(sleepError)) return;
+            throw sleepError;
+          }
+          retryDelayMs = Math.min(retryDelayMs * 2, maxRetryDelayMs);
         } finally {
           waitAbort = null;
         }
@@ -122,7 +182,7 @@ export default function (pi: ExtensionAPI) {
     return role || fallbackRole;
   }
 
-  function startRoleLoop(role: string, instructions: InstructionKind, ctx: any, commandName: string) {
+  async function startRoleLoop(role: string, instructions: InstructionKind, ctx: any, commandName: string) {
     if (activeTask) {
       ctx.ui.notify(`Already have active task ${activeTask.taskId}`, "warning");
       return;
@@ -131,10 +191,67 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("Wait loop is already running", "warning");
       return;
     }
+
+    // Reserve the loop slot before any async preflight to avoid two quick /c1 or /r1
+    // invocations racing into two broker waits.
+    waitLoopRunning = true;
+    stopRequested = false;
     autoContinue = true;
     loopRole = role;
     loopInstructions = instructions;
     loopCommandName = commandName;
+
+    const preflightAbort = new AbortController();
+    waitAbort = preflightAbort;
+    const preflightTimer = setTimeout(() => preflightAbort.abort(), 15000);
+
+    try {
+      const broker = await brokerReady;
+      await broker.ensureInitialized(preflightAbort.signal);
+      const pickedPayload = await broker.listPickedTasks(role, preflightAbort.signal);
+      const picked = firstPickedTask(pickedPayload);
+      if (picked) {
+        let taskMd = picked.taskMd ?? "";
+        if (!taskMd) {
+          try {
+            taskMd = taskMdFromDetails(await broker.getTask(picked.taskId, preflightAbort.signal));
+          } catch (e: any) {
+            if (stopRequested) throw e;
+            ctx.ui.notify(`Picked task detail fetch failed (${e?.message || e}); using lightweight payload`, "warning");
+          }
+        }
+
+        activeTask = {
+          role: picked.role || role,
+          taskId: picked.taskId,
+          taskMd,
+          instructions,
+        };
+        await publishTask(activeTask);
+        ctx.ui.notify(
+          `Found already picked task ${activeTask.taskId}. Please submit solution with <solution ...> template.`,
+          "warning",
+        );
+        waitLoopRunning = false;
+        return;
+      }
+    } catch (e: any) {
+      if (stopRequested) {
+        ctx.ui.notify("loop stopped", "info");
+      } else {
+        const reason = isAbortError(e) ? "preflight timed out or was aborted" : e?.message || e;
+        ctx.ui.notify(`Picked-task check failed (${reason}), continuing to wait`, "warning");
+      }
+    } finally {
+      clearTimeout(preflightTimer);
+      if (waitAbort === preflightAbort) waitAbort = null;
+    }
+
+    if (stopRequested) {
+      waitLoopRunning = false;
+      return;
+    }
+
     void waitLoop(role, instructions, (m, l = "info") => ctx.ui.notify(`[/${commandName}] ${m}`, l));
   }
 
@@ -142,7 +259,7 @@ export default function (pi: ExtensionAPI) {
     description: "Wait for one task from role queue (default role: coder, coder instructions)",
     handler: async (args, ctx) => {
       const role = parseRoleArg(args, "coder");
-      startRoleLoop(role, "coder", ctx, "c1");
+      await startRoleLoop(role, "coder", ctx, "c1");
     },
   });
 
@@ -150,7 +267,7 @@ export default function (pi: ExtensionAPI) {
     description: "Wait for one task from role queue (default role: reviewer, reviewer instructions)",
     handler: async (args, ctx) => {
       const role = parseRoleArg(args, "reviewer");
-      startRoleLoop(role, "reviewer", ctx, "r1");
+      await startRoleLoop(role, "reviewer", ctx, "r1");
     },
   });
 
@@ -175,6 +292,18 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("cbump", {
+    description: "Resend full prompt for current active task",
+    handler: async (_args, ctx) => {
+      if (!activeTask) {
+        ctx.ui.notify("No active task to bump", "warning");
+        return;
+      }
+      await publishTask(activeTask);
+      ctx.ui.notify(`Re-sent task ${activeTask.taskId}`, "info");
+    },
+  });
+
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
     if (!activeTask) return;
@@ -194,6 +323,7 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const broker = await brokerReady;
+      await broker.ensureInitialized();
       await broker.solveTask(solution.taskId, solution.resultMd);
       ctx.ui.notify(`Solved task ${solution.taskId}`, "info");
       activeTask = null;

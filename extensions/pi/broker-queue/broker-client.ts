@@ -76,13 +76,13 @@ export class BrokerClient {
     });
   }
 
-  async ensureInitialized(): Promise<void> {
+  async ensureInitialized(signal?: AbortSignal): Promise<void> {
     if (this.initialized) return;
     await this.call("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
       clientInfo: { name: "pi-broker-extension", version: "0.1.0" },
-    });
+    }, signal);
     this.initialized = true;
   }
 
@@ -92,6 +92,18 @@ export class BrokerClient {
 
   async solveTask(taskId: string, resultMd: string, signal?: AbortSignal) {
     return this.callTool("solve_task", { task_id: taskId, result_md: resultMd }, signal);
+  }
+
+  async listPickedTasks(role: string, signal?: AbortSignal) {
+    return this.callTool("list_tasks", { role, status: "picked" }, signal);
+  }
+
+  async getTask(taskId: string, signal?: AbortSignal) {
+    return this.callTool(
+      "get_task",
+      { task_id: taskId, include_task_md: true, include_result_md: false },
+      signal,
+    );
   }
 
   private async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal) {
@@ -113,11 +125,12 @@ export class BrokerClient {
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
 
     const onAbort = () => ctrl.abort();
+    if (signal?.aborted) ctrl.abort();
     signal?.addEventListener("abort", onAbort);
 
     try {
       const resp = await fetch(this.config.url, {
-                method: "POST",
+        method: "POST",
         headers: { "Content-Type": "application/json", ...(this.config.headers ?? {}) },
         body: JSON.stringify({
           jsonrpc: "2.0",

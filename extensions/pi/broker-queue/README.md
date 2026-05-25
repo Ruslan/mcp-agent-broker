@@ -63,6 +63,8 @@ Notes:
   - Stop active waiting loop.
 - `/cstatus`
   - Show current state (`Idle`, waiting, or active task).
+- `/cbump`
+  - Re-send full prompt for current active task.
 
 Examples:
 - `/c1`
@@ -72,14 +74,16 @@ Examples:
 
 ## Runtime behavior
 
-1. Command starts wait loop (`listen_role --mode wait`).
-2. If transport fails, it retries automatically.
-3. When one task arrives, extension posts:
+1. Command first checks for already picked tasks (`list_tasks --status picked`).
+   - `list_tasks` may return lightweight metadata only, so extension fetches full task text via `get_task` before publishing resumed picked tasks.
+2. If none is picked, command starts wait loop (`listen_role --mode wait`).
+3. If transport fails, it retries automatically.
+4. When one task arrives, extension posts:
    - basic role rules,
    - task id,
    - task markdown,
    - required solution template.
-4. Assistant must reply with:
+5. Assistant must reply with:
 
 ```xml
 <solution task_id="TASK_ID">
@@ -88,13 +92,14 @@ Examples:
 </solution>
 ```
 
-5. Extension parses block and submits `solve_task`.
-6. If continuous mode is active (started via `/c1` or `/r1` and not stopped), it immediately resumes waiting for next task.
+6. Extension parses block and submits `solve_task`.
+7. If continuous mode is active (started via `/c1` or `/r1` and not stopped), it immediately resumes waiting for next task.
 
 ## Important constraints
 
 - Only one active task is handled at a time.
 - New tasks are not pulled while `activeTask` is unsolved.
+- Resume mode picks the first `picked` task for the requested role. It assumes a single worker per role/project or broker-side ownership; if multiple workers share the same role, configure distinct roles.
 - `task_id` can be any non-empty quoted value (except quote/newline).
 
 ## Reload
