@@ -85,10 +85,16 @@ export default function (pi: ExtensionAPI) {
   }
 
   function extractSolutionBlock(content: string): { taskId: string; resultMd: string } | null {
-    const re = /<solution\s+task_id="([^"\n]+)">\s*([\s\S]*?)\s*<\/solution>/i;
-    const m = content.match(re);
-    if (!m) return null;
-    return { taskId: m[1], resultMd: m[2] };
+    const closedRe = /<solution\s+task_id="([^"\n]+)">\s*([\s\S]*?)\s*<\/solution>/i;
+    const closed = content.match(closedRe);
+    if (closed) return { taskId: closed[1], resultMd: closed[2] };
+
+    // Be tolerant when the assistant starts with a valid solution tag but forgets
+    // the closing </solution>. This avoids losing otherwise complete task reports.
+    const openOnlyRe = /^\s*<solution\s+task_id="([^"\n]+)">\s*([\s\S]*)$/i;
+    const openOnly = content.match(openOnlyRe);
+    if (!openOnly) return null;
+    return { taskId: openOnly[1], resultMd: openOnly[2].trimEnd() };
   }
 
   async function publishTask(task: ActiveTask) {
