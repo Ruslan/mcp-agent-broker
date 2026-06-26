@@ -89,6 +89,7 @@ func (h *JSONRPCHandler) validateProjectID(r *http.Request) (string, error) {
 
 func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -117,16 +118,10 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	isNotification := req.ID == nil || string(req.ID) == "null"
+	isNotification := req.ID == nil
 	if isNotification {
-		if req.Method == "notifications/initialized" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if req.ID == nil {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+		w.WriteHeader(http.StatusAccepted)
+		return
 	}
 
 	ctx := r.Context()

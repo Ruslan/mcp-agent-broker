@@ -98,6 +98,23 @@ func TestJSONRPC_ServeHTTP(t *testing.T) {
 	}
 }
 
+func TestJSONRPC_NotificationReturnsAccepted(t *testing.T) {
+	broker := newTestBroker(t, true, true)
+	handler := &JSONRPCHandler{broker: broker}
+
+	req := httptest.NewRequest(http.MethodPost, "/rpc", bytes.NewReader([]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)))
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("Expected status 202, got %d", rr.Code)
+	}
+	if rr.Body.Len() != 0 {
+		t.Fatalf("Expected empty notification response, got %q", rr.Body.String())
+	}
+}
+
 func TestJSONRPC_HandleToolCall(t *testing.T) {
 	broker := newTestBroker(t, true, true)
 	handler := &JSONRPCHandler{broker: broker}
