@@ -127,6 +127,13 @@ Default server settings:
 3. sync enabled: `true`
 4. async enabled: `true`
 
+### Running as a service (systemd)
+
+For a persistent deployment (autostart on boot, auto-restart, journald logs)
+instead of `make run` in tmux, see [`deploy/README.md`](deploy/README.md).
+Quick start: `make systemd-install` once, then `make systemd-restart` to
+rebuild and redeploy.
+
 ## Endpoints
 
 MCP / JSON-RPC:

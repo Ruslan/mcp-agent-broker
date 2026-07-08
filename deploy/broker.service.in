@@ -1,0 +1,29 @@
+# Template — do not install directly.
+# `make systemd-install` renders the placeholders (user, group, working dir,
+# port, db path) from the current environment and installs the result to
+# /etc/systemd/system/broker.service.
+[Unit]
+Description=Agent Task Broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__GROUP__
+WorkingDirectory=__WORKDIR__
+Environment=PORT=__PORT__
+Environment=DB_PATH=__DB_PATH__
+ExecStart=__WORKDIR__/broker
+Restart=on-failure
+RestartSec=3
+
+# Light sandboxing (keeps access to data/ and the binary)
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=__WORKDIR__/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
