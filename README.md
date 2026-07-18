@@ -177,8 +177,55 @@ Supported environment variables:
 4. `API_KEY`: optional API key for authentication. If set, clients must use `Authorization: Bearer <key>` header.
 5. `ENABLE_SYNC`: enables `await_task` and `listen_role(mode="wait")`, default `true`
 6. `ENABLE_ASYNC`: enables `listen_role(mode="poll")`, default `true`
+7. `BROKER_PUBLIC_URL`: base URL used to build the `poll_url` values handed to clients (e.g.
+   `https://broker.example.com`). Recommended for any non-localhost deployment. When unset, the base is
+   the request `Host`.
+8. `BROKER_TRUST_FORWARDED`: when `true`, honor `X-Forwarded-Proto`/`X-Forwarded-Host` when building
+   `poll_url`. Default off — enable it ONLY behind a proxy you trust to set those headers, since they
+   are otherwise client-forgeable (a poisoned value would point a poller's capability token at another
+   host). Prefer `BROKER_PUBLIC_URL`, which sidesteps the headers entirely.
 
 At least one of `ENABLE_SYNC` or `ENABLE_ASYNC` must stay enabled.
+
+## Async pollers (keep working, get woken)
+
+`listen_role(mode="wait")` and `await_task` block the calling turn *inside* the tool call — the agent
+can't do anything else while it waits. For harnesses that re-invoke an agent when a **backgrounded
+process exits** (Claude Code `run_in_background`, agy), the broker hands back a **`poll_url`** that a
+dumb background script polls, turning "wait" into "keep working, get woken".
+
+**The `poll_url` capability.** `create_task`, `listen_role(mode="poll")`, and `get_task` return a
+`poll_url` like `http://host:9197/poll/<token>` — an unguessable token **in the path**. That URL *is*
+the authorization: `GET /poll/<token>` is served **without any API key or header** (it isn't behind the
+command-channel auth), so a poller is just `curl "$poll_url"`. A role `poll_url` picks a queued task; a
+task `poll_url` reports status and returns `result_md` once solved.
+
+- **`broker-poll.sh <poll_url>`** — worker. Polls a role `poll_url` until a task is queued, **picks**
+  it, prints it, exits 0.
+- **`await-poll.sh <poll_url>`** — dispatcher. Polls a task `poll_url` until `solved`, prints the
+  result, exits 0.
+- **`broker-monitor.sh <poll_url>`** — streaming variant that never exits (for a Monitor-style tool);
+  emits each new event as a JSONL line.
+
+Arm one on the `poll_url` in the background, keep working, and the harness wakes the agent when the
+script exits. Env: `BROKER_POLL_URL` (the url, if not passed as `$1`), `BROKER_INTERVAL` (default 5),
+`BROKER_MAX_FAIL` (default 12), `BROKER_MAX_WAIT` (opt-in per-turn bound, exit 4; unbounded by default).
+
+**Token expiry — go get a new one.** The token in a `poll_url` has a **sliding ~30-minute TTL**: each
+poll renews it, so an actively-polling script keeps it alive, up to a **hard 24-hour cap** from
+creation. A leaked `poll_url` therefore can't be read from "a day later", and a stalled poller's token
+dies within 30 minutes. An **expired** token (existed, then slid out or hit the cap) returns `200
+{"status":"expired"}`; an **unknown** token returns a bare **404**, as if the URL never existed, so
+probing random tokens reveals nothing about the `/poll` surface. Either way the script exits **5** and
+the agent calls `listen_role` (worker) or `get_task` (dispatcher) again for a fresh `poll_url`. Because
+the token is a capability, not encryption, serve a public broker over TLS.
+
+**Installing the scripts (no local clone needed).** Any MCP client connected to the broker can pull
+the scripts via the `skill-install` prompt (`prompts/get skill-install`), which prints
+`broker-poll.sh` / `await-poll.sh` / `broker-monitor.sh` / `SKILL.md` verbatim (embedded in the broker
+binary) with install instructions. The canonical sources live in `agent-broker/skillfiles/`;
+`make sync-skillfiles` regenerates the `.claude/skills/broker-async-poll/` install copy, and a parity
+test keeps the two in lockstep.
 
 ## Tool Summary
 
@@ -201,9 +248,14 @@ Response:
 ```json
 {
   "task_id": "...",
-  "status": "queued"
+  "status": "queued",
+  "poll_url": "http://host:9197/poll/<token>"
 }
 ```
+
+`poll_url` is a capability URL scoped to this `task_id`, for arming `await-poll.sh` — see
+[Async pollers](#async-pollers-keep-working-get-woken). `listen_role(mode="poll")` returns an analogous
+`poll_url` scoped to `(project, role)`, and `get_task` returns a fresh one.
 
 ### `await_task`
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-07-18
+
+- Added a `poll_url` capability URL for fully-async orchestration. `create_task`,
+  `listen_role(mode="poll")`, and `get_task` return a `poll_url` (`GET /poll/<token>`, token in the
+  path) that is served **without any API key** — a background script just `curl "$poll_url"`. A role
+  URL picks a queued task; a task URL reports status and the result once solved.
+- Poll tokens have a **sliding 30-minute TTL** (each poll renews) and a **hard 24-hour cap**, so a
+  leaked `poll_url` can't be read a day later and a stalled poller's token dies within 30 minutes. An
+  expired token returns `200 {"status":"expired"}`; an unknown token returns a bare `404` (as if the
+  URL never existed) so probing reveals nothing. The client re-fetches a fresh `poll_url` in both cases.
+- Added self-installing poller scripts (`broker-poll.sh`, `await-poll.sh`, `broker-monitor.sh`),
+  embedded in the binary and installable over MCP via the `skill-install` prompt.
+- Added `BROKER_PUBLIC_URL` to override the base used when building `poll_url` (default: derived from
+  `X-Forwarded-*` / request `Host`).
+
 ## 2026-06-26
 
 - Fixed MCP JSON-RPC compatibility with IDE and harness clients that expect notifications to return `202 Accepted` with an empty body.

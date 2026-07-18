@@ -76,6 +76,15 @@ type Broker struct {
 	EnableSync  bool
 	EnableAsync bool
 
+	// PublicURL, when set (BROKER_PUBLIC_URL), overrides the base used to build
+	// poll_url values handed to clients. Empty → derive the base per-request from
+	// the request Host (and X-Forwarded-* only when TrustForwarded is set).
+	PublicURL string
+	// TrustForwarded (BROKER_TRUST_FORWARDED) allows X-Forwarded-Proto/Host to set
+	// the poll_url base — only enable it behind a proxy you trust to set them, as
+	// they are otherwise client-forgeable.
+	TrustForwarded bool
+
 	adminSubs   map[chan statusEvent]struct{}
 	adminSubsMu sync.Mutex
 
@@ -169,6 +178,59 @@ func generateTaskID() string {
 		return fmt.Sprintf("%x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// Poll token constants. A poll token is the capability embedded in a poll_url
+// (GET /poll/{token}); it authorizes exactly one scoped poll and nothing else.
+const (
+	// pollTokenTTL is the sliding lifetime: each poll of /poll/{token} renews the
+	// token by this much, so an actively-polling script keeps it alive. Stall
+	// longer than this and the token dies — go fetch a fresh poll_url.
+	pollTokenTTL = 30 * time.Minute
+	// pollTokenMaxLifetime is the absolute cap from creation, regardless of
+	// renewal, so a leaked token can never be read from "a day later": even a
+	// continuously-polled token rotates out at this bound.
+	pollTokenMaxLifetime = 24 * time.Hour
+	// pollTokenReuseFloor: reuse an existing token for a scope only while it has
+	// at least this much life left, so a caller never gets a near-dead one.
+	pollTokenReuseFloor = 5 * time.Minute
+	PollScopeRole       = "role"
+	PollScopeTask       = "task"
+)
+
+// MintPollToken returns a scoped poller token for (projectID, kind, value),
+// reusing an existing token for the same scope when it still has life left so
+// repeated mints don't accumulate rows. kind is PollScopeRole or PollScopeTask.
+func (b *Broker) MintPollToken(projectID, kind, value string) (*PollTokenScope, error) {
+	if existing, err := b.store.GetActivePollToken(projectID, kind, value); err == nil && existing != nil {
+		if time.Until(existing.ExpiresAt) >= pollTokenReuseFloor {
+			return existing, nil
+		}
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, fmt.Errorf("failed to generate poll token: %w", err)
+	}
+	now := time.Now().UTC()
+	scope := &PollTokenScope{
+		Token:     hex.EncodeToString(raw),
+		ProjectID: projectID,
+		Kind:      kind,
+		Value:     value,
+		CreatedAt: now,
+		ExpiresAt: now.Add(pollTokenTTL),
+	}
+	if err := b.store.InsertPollToken(scope.Token, scope.ProjectID, scope.Kind, scope.Value, scope.CreatedAt, scope.ExpiresAt); err != nil {
+		return nil, err
+	}
+	return scope, nil
+}
+
+// RenewPollToken validates and slides a token's expiry forward. It returns the
+// live scope, or (nil, found) where found distinguishes an expired token
+// (found=true) from an unknown one (found=false). See store.RenewPollToken.
+func (b *Broker) RenewPollToken(token string) (*PollTokenScope, bool, error) {
+	return b.store.RenewPollToken(token, pollTokenTTL, pollTokenMaxLifetime)
 }
 
 func (b *Broker) resultDiagnostics(projectID, taskID string) (bool, int, error) {
@@ -951,7 +1013,7 @@ func (b *Broker) ListPrompts() ([]PromptMetadata, error) {
 		return templates[i].Name < templates[j].Name
 	})
 
-	prompts := make([]PromptMetadata, 0, len(templates))
+	prompts := make([]PromptMetadata, 0, len(templates)+1)
 	for _, tmpl := range templates {
 		prompts = append(prompts, PromptMetadata{
 			Name:        tmpl.Name,
@@ -960,13 +1022,31 @@ func (b *Broker) ListPrompts() ([]PromptMetadata, error) {
 			Arguments:   tmpl.Arguments,
 		})
 	}
+	// skill-install is served from the embedded skillfiles, not a disk template,
+	// so its body stays byte-identical to the shipped scripts by construction.
+	prompts = append(prompts, skillInstallPromptMetadata())
 	return prompts, nil
+}
+
+// skillInstallPromptMetadata is the ListPrompts/GetPrompt metadata for the
+// embed-backed skill-install prompt.
+func skillInstallPromptMetadata() PromptMetadata {
+	return PromptMetadata{
+		Name:        skillInstallPromptName,
+		Title:       "Install broker-async-poll skill",
+		Description: skillInstallPromptDescription,
+	}
 }
 
 // GetPrompt returns the content of a specific prompt file.
 func (b *Broker) GetPrompt(name string, arguments map[string]string) (PromptMetadata, string, error) {
 	if !isSafeID(name) {
 		return PromptMetadata{}, "", fmt.Errorf("invalid prompt name")
+	}
+	// skill-install is assembled from the embedded skillfiles at request time,
+	// keeping the installer prompt and the shipped scripts identical.
+	if name == skillInstallPromptName {
+		return skillInstallPromptMetadata(), buildSkillInstallPrompt(), nil
 	}
 	tmpl, err := b.findPromptTemplate(name)
 	if err != nil {

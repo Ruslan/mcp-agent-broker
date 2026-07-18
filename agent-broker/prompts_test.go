@@ -27,11 +27,16 @@ func TestBroker_ListPrompts_UsesFrontMatterOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(prompts) != 2 {
-		t.Fatalf("expected 2 prompts, got %d", len(prompts))
+	// Two on-disk prompts, ordered by front-matter order, plus the embed-backed
+	// skill-install appended last.
+	if len(prompts) != 3 {
+		t.Fatalf("expected 3 prompts, got %d", len(prompts))
 	}
 	if prompts[0].Name != "first" || prompts[1].Name != "second" {
 		t.Fatalf("unexpected prompt order: %+v", prompts)
+	}
+	if prompts[2].Name != skillInstallPromptName {
+		t.Fatalf("expected %q appended last, got %q", skillInstallPromptName, prompts[2].Name)
 	}
 	if len(prompts[0].Arguments) != 1 || prompts[0].Arguments[0].Name != "role_name" {
 		t.Fatalf("expected role_name argument metadata, got %+v", prompts[0].Arguments)

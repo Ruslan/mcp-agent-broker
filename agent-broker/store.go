@@ -54,7 +54,33 @@ type Store interface {
 	// LoadActiveTasks returns all queued and picked tasks for memory restoration on startup.
 	LoadActiveTasks() ([]TaskRecord, error)
 
+	// InsertPollToken persists a scoped poller capability token. Implementations
+	// prune expired rows on write so the table stays bounded.
+	InsertPollToken(token, projectID, scopeKind, scopeValue string, createdAt, expiresAt time.Time) error
+	// GetActivePollToken returns an existing unexpired token for the given scope,
+	// or nil if none — so repeated mints for the same scope reuse one token.
+	GetActivePollToken(projectID, scopeKind, scopeValue string) (*PollTokenScope, error)
+	// RenewPollToken validates a token and, if live, slides its expiry forward by
+	// ttl (capped at createdAt+maxLifetime), returning the refreshed scope. The
+	// bool reports whether a row EXISTED (even if expired/capped), so the caller
+	// can distinguish an expired token (found=true, scope=nil → "expired") from an
+	// unknown one (found=false → 404, as if the URL never existed).
+	RenewPollToken(token string, ttl, maxLifetime time.Duration) (scope *PollTokenScope, found bool, err error)
+
 	Close() error
+}
+
+// PollTokenScope is a scoped poller capability: the narrow authority to poll one
+// role queue (kind="role", value=<role>) or await one task (kind="task",
+// value=<task_id>) within one project. It carries a sliding expiry (renewed on
+// each poll) and, via CreatedAt + an absolute cap, a hard maximum lifetime.
+type PollTokenScope struct {
+	Token     string
+	ProjectID string
+	Kind      string
+	Value     string
+	CreatedAt time.Time
+	ExpiresAt time.Time
 }
 
 // SQLiteStore is the production Store backed by a SQLite database.
@@ -109,6 +135,15 @@ func sqliteMigrate(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_progress_task ON task_progress (project_id, task_id)`,
 		`ALTER TABLE tasks ADD COLUMN result_view_count INTEGER NOT NULL DEFAULT 0`,
+		`CREATE TABLE IF NOT EXISTS poll_tokens (
+			token       TEXT PRIMARY KEY,
+			project_id  TEXT NOT NULL,
+			scope_kind  TEXT NOT NULL,
+			scope_value TEXT NOT NULL,
+			created_at  TEXT NOT NULL,
+			expires_at  TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_poll_tokens_scope ON poll_tokens (project_id, scope_kind, scope_value)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -387,6 +422,111 @@ func (s *SQLiteStore) LoadActiveTasks() ([]TaskRecord, error) {
 		records = append(records, r)
 	}
 	return records, rows.Err()
+}
+
+// InsertPollToken persists a scoped token and opportunistically prunes expired
+// rows so the table trends back to empty on an idle broker. Timestamps are
+// stored as RFC3339 UTC, which is lexicographically ordered, so string
+// comparison against a formatted "now" is a valid expiry test.
+func (s *SQLiteStore) InsertPollToken(token, projectID, scopeKind, scopeValue string, createdAt, expiresAt time.Time) error {
+	// Prune only rows past their absolute lifetime (created_at + maxLifetime), NOT
+	// merely past their sliding expiry — a recently-expired row must survive so
+	// GET /poll can answer "expired" (not 404) to a legit poller that just stalled.
+	// created_at is RFC3339 UTC (lexicographically ordered), so a string compare
+	// against the cutoff is valid.
+	capCutoff := time.Now().UTC().Add(-pollTokenMaxLifetime).Format(time.RFC3339)
+	if _, err := s.db.Exec(`DELETE FROM poll_tokens WHERE created_at <= ?`, capCutoff); err != nil {
+		return fmt.Errorf("failed to prune expired poll tokens: %w", err)
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO poll_tokens (token, project_id, scope_kind, scope_value, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		token, projectID, scopeKind, scopeValue, createdAt.UTC().Format(time.RFC3339), expiresAt.UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert poll token: %w", err)
+	}
+	return nil
+}
+
+// GetActivePollToken returns the most-distant unexpired token for a scope, so a
+// repeated mint reuses one token instead of accumulating rows.
+func (s *SQLiteStore) GetActivePollToken(projectID, scopeKind, scopeValue string) (*PollTokenScope, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	row := s.db.QueryRow(
+		`SELECT token, project_id, scope_kind, scope_value, created_at, expires_at
+		 FROM poll_tokens
+		 WHERE project_id = ? AND scope_kind = ? AND scope_value = ? AND expires_at > ?
+		 ORDER BY expires_at DESC LIMIT 1`,
+		projectID, scopeKind, scopeValue, now,
+	)
+	return scanPollToken(row)
+}
+
+// RenewPollToken slides a live token's expiry forward by ttl, capped at
+// createdAt+maxLifetime. The row is loaded regardless of expiry so the caller can
+// tell apart:
+//   - found=false, scope=nil → the token never existed (or aged past its cap and
+//     was pruned): the endpoint answers 404.
+//   - found=true,  scope=nil → the token existed but is expired (slid out) or hit
+//     its hard cap: the endpoint answers "expired".
+//   - scope!=nil            → live and renewed.
+func (s *SQLiteStore) RenewPollToken(token string, ttl, maxLifetime time.Duration) (*PollTokenScope, bool, error) {
+	now := time.Now().UTC()
+	row := s.db.QueryRow(
+		`SELECT token, project_id, scope_kind, scope_value, created_at, expires_at
+		 FROM poll_tokens WHERE token = ?`,
+		token,
+	)
+	scope, err := scanPollToken(row)
+	if err != nil {
+		return nil, false, err
+	}
+	if scope == nil {
+		return nil, false, nil // unknown
+	}
+	hardCap := scope.CreatedAt.Add(maxLifetime)
+	if !now.Before(hardCap) {
+		// Past the absolute lifetime — expired; drop the row so it can't linger.
+		_, _ = s.db.Exec(`DELETE FROM poll_tokens WHERE token = ?`, token)
+		return nil, true, nil
+	}
+	if !now.Before(scope.ExpiresAt) {
+		// Slid out of its sliding window (poller stalled) — expired, keep the row
+		// until the hard cap so repeated polls keep getting "expired", not 404.
+		return nil, true, nil
+	}
+	newExp := now.Add(ttl)
+	if newExp.After(hardCap) {
+		newExp = hardCap
+	}
+	if _, err := s.db.Exec(`UPDATE poll_tokens SET expires_at = ? WHERE token = ?`, newExp.UTC().Format(time.RFC3339), token); err != nil {
+		return nil, true, fmt.Errorf("failed to renew poll token: %w", err)
+	}
+	scope.ExpiresAt = newExp
+	return scope, true, nil
+}
+
+func scanPollToken(row *sql.Row) (*PollTokenScope, error) {
+	var (
+		scope   PollTokenScope
+		created string
+		expires string
+	)
+	err := row.Scan(&scope.Token, &scope.ProjectID, &scope.Kind, &scope.Value, &created, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan poll token: %w", err)
+	}
+	if t, perr := time.Parse(time.RFC3339, created); perr == nil {
+		scope.CreatedAt = t
+	}
+	if t, perr := time.Parse(time.RFC3339, expires); perr == nil {
+		scope.ExpiresAt = t
+	}
+	return &scope, nil
 }
 
 func (s *SQLiteStore) Close() error {

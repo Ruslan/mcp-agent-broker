@@ -81,6 +81,7 @@ func main() {
 	enableSync := getEnvBool("ENABLE_SYNC", true)
 	enableAsync := getEnvBool("ENABLE_ASYNC", true)
 	apiKey := os.Getenv("API_KEY")
+	publicURL := strings.TrimSpace(os.Getenv("BROKER_PUBLIC_URL"))
 
 	if err := validateConfig(enableSync, enableAsync); err != nil {
 		log.Fatalf("Fatal: %v", err)
@@ -100,13 +101,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize broker: %v", err)
 	}
+	broker.PublicURL = publicURL
+	broker.TrustForwarded = getEnvBool("BROKER_TRUST_FORWARDED", false)
 
 	handler := &JSONRPCHandler{broker: broker}
 	adminHandler := &AdminHandler{broker: broker}
+	pollHandler := &PollHandler{broker: broker}
 
 	mux := http.NewServeMux()
 	mux.Handle("/rpc", handler)
 	mux.HandleFunc("/health", handler.HealthHandler)
+
+	// Unauthenticated capability-URL poll endpoint: the token in the path is the
+	// authorization (see PollHandler / AuthMiddleware's /poll/ exemption).
+	mux.Handle("GET /poll/{token}", pollHandler)
 
 	// Admin API
 	mux.Handle("/admin/api/", adminHandler)
@@ -141,8 +149,21 @@ func main() {
 	}
 }
 
+// AuthMiddleware gates the command surface with the master API_KEY (when set),
+// exactly as before — EXCEPT the capability-URL poll endpoint. GET /poll/{token}
+// self-authenticates via the unguessable token in its path, so a background
+// `curl "$poll_url"` (which carries no Authorization header) must reach it
+// without the master key. The poll route is deliberately not behind the
+// command-channel credential — the capability token is the authorization.
 func AuthMiddleware(apiKey string, next http.Handler) http.Handler {
+	const prefix = "Bearer "
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Capability-URL poll endpoint: token-in-path is the authorization.
+		if strings.HasPrefix(r.URL.Path, "/poll/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		if apiKey == "" {
 			next.ServeHTTP(w, r)
 			return
@@ -153,19 +174,14 @@ func AuthMiddleware(apiKey string, next http.Handler) http.Handler {
 			http.Error(w, "Unauthorized: Missing Authorization header", http.StatusUnauthorized)
 			return
 		}
-
-		const prefix = "Bearer "
 		if !strings.HasPrefix(authHeader, prefix) {
 			http.Error(w, "Unauthorized: Invalid Authorization header format", http.StatusUnauthorized)
 			return
 		}
-
-		token := strings.TrimPrefix(authHeader, prefix)
-		if token != apiKey {
+		if strings.TrimPrefix(authHeader, prefix) != apiKey {
 			http.Error(w, "Unauthorized: Invalid API key", http.StatusUnauthorized)
 			return
 		}
-
 		next.ServeHTTP(w, r)
 	})
 }

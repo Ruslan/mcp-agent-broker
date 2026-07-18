@@ -1,4 +1,16 @@
-.PHONY: build run test clean ui-build systemd-install systemd-restart systemd-status systemd-logs systemd-stop
+.PHONY: build run test clean ui-build sync-skillfiles systemd-install systemd-restart systemd-status systemd-logs systemd-stop
+
+# Regenerate the install copy of the broker-async-poll skill from the canonical
+# embedded sources. Run this after editing any file under agent-broker/skillfiles/;
+# the parity test (TestSkillfilesMatchCanonical) fails if the two copies drift.
+SKILL_CANON=$(SOURCE_DIR)/skillfiles
+SKILL_INSTALL=.claude/skills/broker-async-poll
+sync-skillfiles:
+	@echo "Syncing $(SKILL_INSTALL) from $(SKILL_CANON)..."
+	@mkdir -p $(SKILL_INSTALL)
+	@cp $(SKILL_CANON)/broker-poll.sh $(SKILL_CANON)/await-poll.sh $(SKILL_CANON)/broker-monitor.sh $(SKILL_CANON)/SKILL.md $(SKILL_INSTALL)/
+	@chmod +x $(SKILL_INSTALL)/broker-poll.sh $(SKILL_INSTALL)/await-poll.sh $(SKILL_INSTALL)/broker-monitor.sh
+	@echo "Done."
 
 # Variables
 BINARY_NAME=broker

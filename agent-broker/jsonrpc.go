@@ -125,6 +125,10 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	// Base URL for poll_url values handed back to clients (derived per-request so
+	// a remote agent gets a reachable host; overridable via BROKER_PUBLIC_URL).
+	pollBase := pollBaseURL(r, h.broker.PublicURL, h.broker.TrustForwarded)
+
 	var result any
 	var rpcErr *RPCError
 	var toolName string
@@ -304,7 +308,7 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			toolName = params.Name
 			toolStartedAt = time.Now()
-			res, err := h.handleToolCall(ctx, projectID, params.Name, params.Arguments)
+			res, err := h.handleToolCall(ctx, projectID, pollBase, params.Name, params.Arguments)
 			if err != nil {
 				elapsed := time.Since(toolStartedAt)
 				log.Printf("tool=%s project=%s err=%q elapsed=%s", params.Name, projectID, err.Error(), elapsed.Round(time.Millisecond))
@@ -361,7 +365,18 @@ func listenRoleTaskID(res any) string {
 	return taskID
 }
 
-func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name string, args json.RawMessage) (any, error) {
+// mintPollURL mints a scoped poll token for (projectID, kind, value) and returns
+// the full capability URL for it. Best-effort: on any error it returns "" so the
+// caller simply omits poll_url rather than failing the tool.
+func (h *JSONRPCHandler) mintPollURL(projectID, base, kind, value string) string {
+	tok, err := h.broker.MintPollToken(projectID, kind, value)
+	if err != nil || tok == nil {
+		return ""
+	}
+	return buildPollURL(base, tok.Token)
+}
+
+func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, pollBase, name string, args json.RawMessage) (any, error) {
 	switch name {
 	case "create_task":
 		var p struct {
@@ -376,10 +391,16 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{
+		resp := map[string]any{
 			"task_id": taskID,
 			"status":  "queued",
-		}, nil
+		}
+		// Hand back a task-scoped poll_url so the dispatcher can arm a poller with
+		// a capability URL (no master key). Best-effort — never fails task creation.
+		if url := h.mintPollURL(projectID, pollBase, PollScopeTask, taskID); url != "" {
+			resp["poll_url"] = url
+		}
+		return resp, nil
 
 	case "await_task":
 		if !h.broker.EnableSync {
@@ -431,20 +452,43 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 			return nil, err
 		}
 
-		if task == nil {
-			return map[string]any{
-				"task":   nil,
-				"status": status, // "empty" or "timeout"
-			}, nil
+		// Hand back a role-scoped poll_url so the worker can arm a background
+		// poller. Minted on poll mode (the async path) and on a wait-mode
+		// TIMEOUT — a blocking waiter that came back empty should switch to the
+		// async poller rather than block again. Gated on EnableAsync: with async
+		// disabled there is no poller path to offer, so we must not mint the url
+		// (nor advise it) — otherwise the poll endpoint would resurrect the exact
+		// capability the operator turned off. A wait that returns a task needs none.
+		pollURL := ""
+		if h.broker.EnableAsync && (p.Mode == "poll" || (p.Mode == "wait" && task == nil)) {
+			pollURL = h.mintPollURL(projectID, pollBase, PollScopeRole, p.Role)
 		}
 
-		return map[string]any{
+		if task == nil {
+			resp := map[string]any{
+				"task":   nil,
+				"status": status, // "empty" (poll) or "timeout" (wait)
+			}
+			if pollURL != "" {
+				resp["poll_url"] = pollURL
+				if p.Mode == "wait" {
+					resp["advice"] = "no task within the wait timeout — arm broker-poll.sh on poll_url to be woken asynchronously instead of blocking again"
+				}
+			}
+			return resp, nil
+		}
+
+		resp := map[string]any{
 			"task": map[string]any{
 				"task_id": task.ID,
 				"title":   task.Title,
 				"task_md": task.MD,
 			},
-		}, nil
+		}
+		if pollURL != "" {
+			resp["poll_url"] = pollURL
+		}
+		return resp, nil
 
 	case "list_tasks":
 		var p struct {
@@ -499,6 +543,15 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, name str
 			if err == nil {
 				resp["result_md"] = res
 				_, _ = h.broker.IncrementResultViewCount(projectID, p.TaskID)
+			}
+		}
+
+		// Include a fresh task-scoped poll_url (unless already solved) so a
+		// dispatcher whose poller token expired can re-arm without re-creating the
+		// task — the "get the task again → new poll_url" path.
+		if meta.Status != StatusSolved {
+			if url := h.mintPollURL(projectID, pollBase, PollScopeTask, p.TaskID); url != "" {
+				resp["poll_url"] = url
 			}
 		}
 

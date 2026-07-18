@@ -30,7 +30,7 @@ func TestHandleToolCall_ProgressTask(t *testing.T) {
 
 	// Send progress via RPC
 	args, _ := json.Marshal(map[string]string{"task_id": taskID, "message": "halfway there"})
-	res, err := handler.handleToolCall(ctx, projectID, "progress_task", args)
+	res, err := handler.handleToolCall(ctx, projectID, "", "progress_task", args)
 	if err != nil {
 		t.Fatalf("progress_task failed: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestHandleToolCall_ProgressTask(t *testing.T) {
 	}()
 
 	awaitArgs, _ := json.Marshal(map[string]any{"task_id": taskID, "timeout_ms": 500})
-	res, err = handler.handleToolCall(ctx, projectID, "await_task", awaitArgs)
+	res, err = handler.handleToolCall(ctx, projectID, "", "await_task", awaitArgs)
 	if err != nil {
 		t.Fatalf("await_task failed: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestHandleToolCall_ProgressTask_Validation(t *testing.T) {
 
 	// Missing message
 	args, _ := json.Marshal(map[string]string{"task_id": "abc"})
-	_, err := handler.handleToolCall(ctx, projectID, "progress_task", args)
+	_, err := handler.handleToolCall(ctx, projectID, "", "progress_task", args)
 	if err == nil {
 		t.Error("Expected error for missing message")
 	}
@@ -72,14 +72,14 @@ func TestHandleToolCall_ProgressTask_Validation(t *testing.T) {
 	// Message too long
 	longMsg := string(make([]byte, 501))
 	args, _ = json.Marshal(map[string]string{"task_id": "abc", "message": longMsg})
-	_, err = handler.handleToolCall(ctx, projectID, "progress_task", args)
+	_, err = handler.handleToolCall(ctx, projectID, "", "progress_task", args)
 	if err == nil {
 		t.Error("Expected error for message too long")
 	}
 
 	// Nonexistent task
 	args, _ = json.Marshal(map[string]string{"task_id": "nonexistent", "message": "hi"})
-	_, err = handler.handleToolCall(ctx, projectID, "progress_task", args)
+	_, err = handler.handleToolCall(ctx, projectID, "", "progress_task", args)
 	if err == nil {
 		t.Error("Expected error for nonexistent task")
 	}

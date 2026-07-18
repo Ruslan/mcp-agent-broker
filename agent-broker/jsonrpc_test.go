@@ -123,7 +123,7 @@ func TestJSONRPC_HandleToolCall(t *testing.T) {
 
 	// 1. Create task
 	createArgs := `{"role":"coder", "title":"Test Task", "task_md":"Do something"}`
-	res, err := handler.handleToolCall(ctx, projectID, "create_task", json.RawMessage(createArgs))
+	res, err := handler.handleToolCall(ctx, projectID, "", "create_task", json.RawMessage(createArgs))
 	if err != nil {
 		t.Fatalf("create_task failed: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestJSONRPC_HandleToolCall(t *testing.T) {
 
 	// 2. Listen role
 	listenArgs := `{"role":"coder", "mode":"poll", "timeout_ms":0}`
-	res, err = handler.handleToolCall(ctx, projectID, "listen_role", json.RawMessage(listenArgs))
+	res, err = handler.handleToolCall(ctx, projectID, "", "listen_role", json.RawMessage(listenArgs))
 	if err != nil {
 		t.Fatalf("listen_role failed: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestJSONRPC_HandleToolCall(t *testing.T) {
 		"result_md": "Done",
 	}
 	solveArgsBytes, _ := json.Marshal(solveArgs)
-	res, err = handler.handleToolCall(ctx, projectID, "solve_task", json.RawMessage(solveArgsBytes))
+	res, err = handler.handleToolCall(ctx, projectID, "", "solve_task", json.RawMessage(solveArgsBytes))
 	if err != nil {
 		t.Fatalf("solve_task failed: %v", err)
 	}
@@ -161,14 +161,14 @@ func TestJSONRPC_HandleToolCall(t *testing.T) {
 		"include_result_md": true,
 	}
 	getArgsBytes, _ := json.Marshal(getArgs)
-	res, err = handler.handleToolCall(ctx, projectID, "get_task", json.RawMessage(getArgsBytes))
+	res, err = handler.handleToolCall(ctx, projectID, "", "get_task", json.RawMessage(getArgsBytes))
 	if err != nil {
 		t.Fatalf("get_task failed: %v", err)
 	}
 
 	// 5. List tasks
 	listArgs := `{"role":"coder"}`
-	res, err = handler.handleToolCall(ctx, projectID, "list_tasks", json.RawMessage(listArgs))
+	res, err = handler.handleToolCall(ctx, projectID, "", "list_tasks", json.RawMessage(listArgs))
 	if err != nil {
 		t.Fatalf("list_tasks failed: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestJSONRPC_HandleToolCall(t *testing.T) {
 		"timeout_ms": 100,
 	}
 	awaitArgsBytes, _ := json.Marshal(awaitArgs)
-	res, err = handler.handleToolCall(ctx, projectID, "await_task", json.RawMessage(awaitArgsBytes))
+	res, err = handler.handleToolCall(ctx, projectID, "", "await_task", json.RawMessage(awaitArgsBytes))
 	if err != nil {
 		t.Fatalf("await_task failed: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestHandleToolCall_ListTasksDefaultsToMostRecent20(t *testing.T) {
 		}
 	}
 
-	res, err := handler.handleToolCall(ctx, projectID, "list_tasks", json.RawMessage(`{"role":"coder"}`))
+	res, err := handler.handleToolCall(ctx, projectID, "", "list_tasks", json.RawMessage(`{"role":"coder"}`))
 	if err != nil {
 		t.Fatalf("list_tasks failed: %v", err)
 	}
