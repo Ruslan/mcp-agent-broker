@@ -28,7 +28,7 @@
 # poll_url), 64 usage, 69 missing curl/jq. On "solved" (task scope) it prints the
 # result and exits 0 — the task is terminal.
 #
-# BROKER_SKILL_VERSION=4
+# BROKER_SKILL_VERSION=5
 set -u
 
 url="${1:-${BROKER_POLL_URL:-}}"
@@ -62,7 +62,8 @@ bail_if_stuck() {
 }
 
 while :; do
-  resp=$(curl -s -w '\n%{http_code}' "$url")
+  # -L follows a proxy redirect (e.g. an http->https bounce) so the poll lands.
+  resp=$(curl -sL -w '\n%{http_code}' "$url")
   if [ $? -ne 0 ]; then
     bail_if_stuck; sleep "$interval"; continue
   fi

@@ -20,6 +20,13 @@ header, no API key**. It's a cheap, disposable capability — hand it to a dumb 
 - `listen_role(role, mode="poll")` → `{ task?, poll_url }` — the poll_url takes tasks for THAT role.
 - `get_task(task_id)` → also returns a fresh `poll_url` (so a dispatcher can re-arm after expiry).
 
+## Strict capability-URL policy
+Poll the **exact** `poll_url` the broker returned, verbatim — host, scheme, and token as given. Do
+**not** rewrite its host to `localhost`, hunt for a local broker process, or scan the local system when
+a poll fails: the token is scoped to that one URL, and a network error just means "retry the same URL"
+(or the token expired → fetch a fresh `poll_url` from `listen_role` / `get_task`). The `poll_url` is the
+only broker endpoint the poller ever needs.
+
 ## The scripts
 Three tiny `curl`+`jq` scripts, each taking a poll_url (as `$1` or `BROKER_POLL_URL`):
 

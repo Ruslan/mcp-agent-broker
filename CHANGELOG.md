@@ -2,6 +2,14 @@
 
 ## 2026-07-21
 
+- `poll_url` now honors `X-Forwarded-Proto` **by default** (no `BROKER_TRUST_FORWARDED` needed), so a
+  broker behind a TLS-terminating proxy (Caddy/nginx) emits `https://` URLs automatically — no
+  cleartext hop that would expose the capability token, and no hardcoded public domain. Only
+  `X-Forwarded-Host` stays gated behind `BROKER_TRUST_FORWARDED`, since a forged host (unlike a forged
+  scheme) would redirect a live token to another host.
+- Poller scripts (`BROKER_SKILL_VERSION` 4 → 5): `curl -sL` so a stray proxy redirect still lands
+  (defense in depth), and SKILL.md gains a strict capability-URL policy — poll the exact `poll_url`
+  verbatim, never rewrite the host to `localhost` or scan the local system.
 - Added a plain-HTTP skill installer at `GET /skill/install` for harnesses that can't pull MCP prompts.
   It returns the same body as the `skill-install` prompt as `text/markdown` with **no API key** (exempt
   like `/poll/`), plus an `X-Broker-Skill-Version` header — so `wget http://host:9197/skill/install`

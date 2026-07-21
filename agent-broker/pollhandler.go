@@ -104,14 +104,24 @@ func (h *PollHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // pollBaseURL derives the externally-reachable base URL used to build poll_url,
 // so a remote agent polls the right host. Precedence: explicit BROKER_PUBLIC_URL
-// override → (only when trustForwarded) X-Forwarded-Proto/Host → the request Host.
+// override → X-Forwarded-Proto (always) / X-Forwarded-Host (only when trusted) →
+// the request scheme + Host.
 //
-// X-Forwarded-* is client-controllable through a naive proxy; trusting it blindly
-// would let an attacker forge a poll_url pointing the victim's background `curl`
-// (which carries a live capability token) at the attacker's host. So it is
-// honored ONLY behind an explicitly-trusted proxy (BROKER_TRUST_FORWARDED). A
-// public deployment should set BROKER_PUBLIC_URL, which sidesteps the headers
-// entirely. Returns "" when no host resolves (client falls back to localhost).
+// The two X-Forwarded-* headers carry very different risk, so they are gated
+// differently:
+//
+//   - X-Forwarded-Proto only flips the scheme (http/https) of the URL handed
+//     back to the SAME caller; it never changes which host the token is sent to,
+//     so a forged value can at most downgrade the caller's own poll_url — no
+//     cross-tenant exfiltration. It is therefore honored UNCONDITIONALLY, which
+//     lets a broker behind a TLS-terminating proxy (Caddy, nginx) emit https://
+//     poll_urls with no config and no hardcoded public domain.
+//   - X-Forwarded-Host changes WHERE the token goes: a forged value would point
+//     the victim's background `curl` (carrying a live capability token) at an
+//     attacker's host. It stays gated behind BROKER_TRUST_FORWARDED.
+//
+// A public deployment can still set BROKER_PUBLIC_URL to pin both explicitly.
+// Returns "" when no host resolves (client falls back to localhost).
 func pollBaseURL(r *http.Request, override string, trustForwarded bool) string {
 	if override != "" {
 		return strings.TrimRight(override, "/")
@@ -120,11 +130,22 @@ func pollBaseURL(r *http.Request, override string, trustForwarded bool) string {
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	host := r.Host
-	if trustForwarded {
-		if p := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); p != "" {
+	// X-Forwarded-Proto is safe to trust (scheme-only, same host) — honor it so a
+	// broker behind a TLS proxy reports https without configuration.
+	if p := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); p != "" {
+		// A proxy chain may send a comma-separated list; the client-facing scheme
+		// is the first. Accept only http/https so a junk value can't produce a
+		// "garbage://host" poll_url.
+		if i := strings.IndexByte(p, ','); i >= 0 {
+			p = strings.TrimSpace(p[:i])
+		}
+		if p == "http" || p == "https" {
 			scheme = p
 		}
+	}
+	host := r.Host
+	// X-Forwarded-Host redirects the token to an arbitrary host — gate it.
+	if trustForwarded {
 		if h := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); h != "" {
 			host = h
 		}

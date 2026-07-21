@@ -78,11 +78,13 @@ type Broker struct {
 
 	// PublicURL, when set (BROKER_PUBLIC_URL), overrides the base used to build
 	// poll_url values handed to clients. Empty → derive the base per-request from
-	// the request Host (and X-Forwarded-* only when TrustForwarded is set).
+	// the request scheme + Host. X-Forwarded-Proto is always honored (scheme-only,
+	// safe); X-Forwarded-Host only when TrustForwarded is set.
 	PublicURL string
-	// TrustForwarded (BROKER_TRUST_FORWARDED) allows X-Forwarded-Proto/Host to set
-	// the poll_url base — only enable it behind a proxy you trust to set them, as
-	// they are otherwise client-forgeable.
+	// TrustForwarded (BROKER_TRUST_FORWARDED) additionally allows X-Forwarded-Host
+	// to set the poll_url host — only enable it behind a proxy you trust, as a
+	// forged Host would redirect a live capability token to an attacker. (X-
+	// Forwarded-Proto is honored regardless: it only flips the scheme.)
 	TrustForwarded bool
 
 	adminSubs   map[chan statusEvent]struct{}

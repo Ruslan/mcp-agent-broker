@@ -165,7 +165,7 @@ func TestPromptsGetSkillInstall(t *testing.T) {
 	// actual file bytes (not a paraphrase) made it into the prompt.
 	snippets := map[string]string{
 		"broker-poll.sh":    `url="${1:-${BROKER_POLL_URL:-}}"`,
-		"await-poll.sh":     `curl -s -w '\n%{http_code}' "$url"`,
+		"await-poll.sh":     `curl -sL -w '\n%{http_code}' "$url"`,
 		"broker-monitor.sh": "broker-monitor.sh",
 		"SKILL.md":          "name: broker-async-poll",
 	}

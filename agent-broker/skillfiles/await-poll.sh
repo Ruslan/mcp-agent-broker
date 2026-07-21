@@ -31,7 +31,7 @@
 #   64  usage error (no poll_url, or a non-integer numeric env var)
 #   69  a required command (curl or jq) is missing
 #
-# BROKER_SKILL_VERSION=4
+# BROKER_SKILL_VERSION=5
 set -u
 
 url="${1:-${BROKER_POLL_URL:-}}"
@@ -66,7 +66,8 @@ bail_if_stuck() {
 }
 
 while :; do
-  resp=$(curl -s -w '\n%{http_code}' "$url")
+  # -L follows a proxy redirect (e.g. an http->https bounce) so the poll lands.
+  resp=$(curl -sL -w '\n%{http_code}' "$url")
   if [ $? -ne 0 ]; then
     bail_if_stuck; sleep "$interval"; continue
   fi

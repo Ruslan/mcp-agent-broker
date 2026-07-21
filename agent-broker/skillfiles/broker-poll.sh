@@ -33,7 +33,7 @@
 #   64  usage error (no poll_url, or a non-integer numeric env var)
 #   69  a required command (curl or jq) is missing
 #
-# BROKER_SKILL_VERSION=4
+# BROKER_SKILL_VERSION=5
 set -u
 
 url="${1:-${BROKER_POLL_URL:-}}"
@@ -71,8 +71,9 @@ bail_if_stuck() {
 
 while :; do
   # Capture body and HTTP status together, no temp file: -w appends "\n<code>",
-  # which we split back off with parameter expansion.
-  resp=$(curl -s -w '\n%{http_code}' "$url")
+  # which we split back off with parameter expansion. -L follows a proxy redirect
+  # (e.g. a misconfigured http->https bounce) so the poll still lands.
+  resp=$(curl -sL -w '\n%{http_code}' "$url")
   if [ $? -ne 0 ]; then
     bail_if_stuck; sleep "$interval"; continue   # connection-level failure
   fi

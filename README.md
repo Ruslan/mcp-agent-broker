@@ -178,12 +178,14 @@ Supported environment variables:
 5. `ENABLE_SYNC`: enables `await_task` and `listen_role(mode="wait")`, default `true`
 6. `ENABLE_ASYNC`: enables `listen_role(mode="poll")`, default `true`
 7. `BROKER_PUBLIC_URL`: base URL used to build the `poll_url` values handed to clients (e.g.
-   `https://broker.example.com`). Recommended for any non-localhost deployment. When unset, the base is
-   the request `Host`.
-8. `BROKER_TRUST_FORWARDED`: when `true`, honor `X-Forwarded-Proto`/`X-Forwarded-Host` when building
-   `poll_url`. Default off — enable it ONLY behind a proxy you trust to set those headers, since they
-   are otherwise client-forgeable (a poisoned value would point a poller's capability token at another
-   host). Prefer `BROKER_PUBLIC_URL`, which sidesteps the headers entirely.
+   `https://broker.example.com`). Pins scheme + host explicitly. When unset, the base is derived from
+   the request scheme + `Host` — behind a TLS-terminating proxy that sets `X-Forwarded-Proto: https`,
+   the derived base is already `https://` (see below), so this is optional even for a public deployment.
+8. `BROKER_TRUST_FORWARDED`: when `true`, also honor `X-Forwarded-Host` when building `poll_url`.
+   Default off — enable it ONLY behind a proxy you trust to set it, since a client-forged host would
+   point a poller's live capability token at another host. Note `X-Forwarded-Proto` is honored
+   **regardless** of this flag: it only flips the scheme (never redirects the token), so a broker behind
+   Caddy/nginx emits `https://` `poll_url`s automatically, with no config and no hardcoded domain.
 
 At least one of `ENABLE_SYNC` or `ENABLE_ASYNC` must stay enabled.
 
