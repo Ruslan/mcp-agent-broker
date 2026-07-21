@@ -227,6 +227,12 @@ binary) with install instructions. The canonical sources live in `agent-broker/s
 `make sync-skillfiles` regenerates the `.claude/skills/broker-async-poll/` install copy, and a parity
 test keeps the two in lockstep.
 
+**Harness can't do MCP prompts?** The same installer is served over plain HTTP at
+`GET /skill/install` — byte-for-byte the `skill-install` body as `text/markdown`, **no API key**
+(non-secret embedded scripts, exempt like `/poll/`). Just `wget http://host:9197/skill/install` (or
+`curl`) and hand the file to any agent; the `X-Broker-Skill-Version` response header carries the
+version for update checks.
+
 ## Tool Summary
 
 ### `create_task`

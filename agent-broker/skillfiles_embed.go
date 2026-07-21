@@ -107,6 +107,14 @@ func buildSkillInstallPrompt() string {
 		"almost always already present). Do this before writing the scripts, so the skill is runnable " +
 		"immediately after install.\n\n")
 
+	fmt.Fprintf(&b, "**Where to put them.** The `%s/` path shown in the headers below is **Claude Code's** "+
+		"skill convention. If your harness is **not** Claude Code, do NOT write into another harness's "+
+		"`.claude/` namespace — it won't be auto-discovered there and just litters the project. Instead "+
+		"place the three `.sh` scripts wherever your own engine keeps executable helpers (its skills / "+
+		"extensions / tools directory, or any dir you can run them from): the path is not load-bearing, "+
+		"only that you can invoke the scripts and read `SKILL.md` next to them for usage. Everything "+
+		"below is identical either way — only the target directory changes.\n\n", skillInstallTargetDir)
+
 	for _, f := range skillInstallFiles() {
 		fmt.Fprintf(&b, "## `%s/%s`\n\n", skillInstallTargetDir, f.name)
 		// Use a fence longer than any backtick run inside the body so a file that
@@ -116,8 +124,9 @@ func buildSkillInstallPrompt() string {
 	}
 
 	b.WriteString("**Create or update:**\n" +
-		"- If `" + skillInstallTargetDir + "/` does not exist: create it, write all three files above " +
-		"verbatim at the paths given, then `chmod +x` the two `.sh` files.\n" +
+		"- If your target directory (default `" + skillInstallTargetDir + "/` for Claude Code — see " +
+		"\"Where to put them\") does not exist: create it, write all three files above verbatim there, " +
+		"then `chmod +x` the two `.sh` files.\n" +
 		"- If it already exists: open its `broker-poll.sh` (or `await-poll.sh`) and read the " +
 		"`BROKER_SKILL_VERSION=<n>` header comment near the top. Only overwrite the three files if this " +
 		"prompt's version (" + fmt.Sprint(BrokerSkillVersion) + ") is **newer** than what's installed; if " +

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-21
+
+- Added a plain-HTTP skill installer at `GET /skill/install` for harnesses that can't pull MCP prompts.
+  It returns the same body as the `skill-install` prompt as `text/markdown` with **no API key** (exempt
+  like `/poll/`), plus an `X-Broker-Skill-Version` header — so `wget http://host:9197/skill/install`
+  hands any agent the embedded, self-contained installer.
+
 ## 2026-07-18
 
 - Added a `poll_url` capability URL for fully-async orchestration. `create_task`,

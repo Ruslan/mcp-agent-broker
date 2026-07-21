@@ -116,6 +116,11 @@ func main() {
 	// authorization (see PollHandler / AuthMiddleware's /poll/ exemption).
 	mux.Handle("GET /poll/{token}", pollHandler)
 
+	// Unauthenticated skill installer over plain HTTP, for harnesses that can't
+	// pull MCP prompts (prompts/get). Same body as the skill-install prompt; the
+	// content is non-secret, so /skill/ is exempt in AuthMiddleware like /poll/.
+	mux.HandleFunc("GET /skill/install", skillInstallHTTP)
+
 	// Admin API
 	mux.Handle("/admin/api/", adminHandler)
 	mux.Handle("/admin/events", adminHandler)
@@ -150,16 +155,19 @@ func main() {
 }
 
 // AuthMiddleware gates the command surface with the master API_KEY (when set),
-// exactly as before — EXCEPT the capability-URL poll endpoint. GET /poll/{token}
+// exactly as before — EXCEPT two non-secret surfaces. GET /poll/{token}
 // self-authenticates via the unguessable token in its path, so a background
 // `curl "$poll_url"` (which carries no Authorization header) must reach it
-// without the master key. The poll route is deliberately not behind the
-// command-channel credential — the capability token is the authorization.
+// without the master key. GET /skill/install serves the embedded, open-source
+// installer scripts and must be `wget`-able by a harness with no credential.
+// Both are deliberately not behind the command-channel credential.
 func AuthMiddleware(apiKey string, next http.Handler) http.Handler {
 	const prefix = "Bearer "
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Capability-URL poll endpoint: token-in-path is the authorization.
-		if strings.HasPrefix(r.URL.Path, "/poll/") {
+		// Skill installer: non-secret embedded scripts, served for harnesses
+		// that can't pull MCP prompts. Both bypass the master key.
+		if strings.HasPrefix(r.URL.Path, "/poll/") || strings.HasPrefix(r.URL.Path, "/skill/") {
 			next.ServeHTTP(w, r)
 			return
 		}
