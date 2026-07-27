@@ -14,3 +14,11 @@ task-data*/
 
 coverage.out
 coverage.html
+
+# Local environment: real server addresses, domains and API keys live here only.
+# `.env.example` is the committed template. The glob covers per-target files such
+# as `.env.kamal` — a deploy whose credentials must NOT leak into the process that
+# `make run`/systemd starts from this directory, since main.go reads ./.env.
+.env
+.env.*
+!.env.example

@@ -1,0 +1,105 @@
+# Kamal 2 deploy — Agent Task Broker.
+#
+# ── This file is COMMITTED to a public repo, so it contains NO real host names,
+#    IPs, domains, registry addresses or keys. Every deployment-specific value is
+#    read from the environment; put your values in a gitignored `.env` at the repo
+#    root (start from `.env.example`) and deploy with `make kamal deploy`, which loads it.
+#
+#    Kamal does NOT read `.env` by itself. `make kamal …` include+export's it; if you
+#    run `kamal …` raw, do `set -a; source .env; set +a` first or the ERB lookups
+#    below resolve to empty and kamal fails with a confusing "servers/web/0" error.
+#
+# The whole app is ONE process: a CGO-free Go binary serving /rpc, /admin (embedded
+# Svelte UI) and the capability-URL poll endpoint, with SQLite on a persistent volume.
+service: <%= ENV.fetch('KAMAL_SERVICE', 'agent-broker') %>
+
+image: <%= ENV.fetch('KAMAL_IMAGE', 'agent-broker/broker') %>
+
+servers:
+  web:
+    hosts:
+      - <%= ENV['KAMAL_SERVER_IP'] %>
+
+# kamal-proxy fronts the app and routes by Host header, so several apps can share
+# one server. Set BROKER_HOST to the domain you serve the broker on.
+#
+# BROKER_PROXY_SSL=true  → let kamal-proxy obtain a Let's Encrypt cert itself.
+# BROKER_PROXY_SSL=false → TLS is terminated upstream (another reverse proxy, a
+#                          tunnel, a load balancer) and forwarded as plain HTTP.
+proxy:
+  ssl: <%= ENV.fetch('BROKER_PROXY_SSL', 'true') %>
+  host: <%= ENV['BROKER_HOST'] %>
+  app_port: <%= ENV.fetch('PORT', '9197') %>
+  # GET /health is unauthenticated by design (see AuthMiddleware) precisely so this
+  # check works — with API_KEY set, an authenticated path would 401 and the deploy
+  # would never go healthy.
+  healthcheck:
+    path: /health
+    interval: 3
+
+# Where the built image is pushed. A public registry (ghcr.io / Docker Hub) needs
+# KAMAL_REGISTRY_USERNAME + KAMAL_REGISTRY_PASSWORD; a local registry on the deploy
+# host (e.g. "localhost:5000", tunnelled to the server by Kamal over SSH) needs
+# neither — leave the credentials unset for that case.
+registry:
+  server: <%= ENV['KAMAL_REGISTRY_SERVER'] %>
+  <% if ENV['KAMAL_REGISTRY_USERNAME'].to_s != '' %>
+  username: <%= ENV['KAMAL_REGISTRY_USERNAME'] %>
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+  <% end %>
+
+builder:
+  arch: <%= ENV.fetch('KAMAL_BUILD_ARCH', 'amd64') %>
+  # Hand-written recipe (UI → Go → alpine), not a Kamal-generated Dockerfile.
+  dockerfile: deploy/Dockerfile
+  context: .
+
+# SQLite lives on a named volume, NOT in the image — a rebuild would otherwise wipe
+# every task, message and poll token. DB_PATH below points inside it.
+volumes:
+  - "<%= ENV.fetch('KAMAL_SERVICE', 'agent-broker') %>_data:/data"
+
+# Anything the broker reads from the environment must be listed here: a var that
+# exists only in `.env` never reaches the container.
+#
+# Every value here is QUOTED on purpose: an unset variable renders as nothing, and
+# a bare `KEY:` is YAML nil, which Kamal rejects with "should be a string" — an error
+# that points at the config rather than at the empty variable behind it.
+env:
+  clear:
+    PORT: "<%= ENV.fetch('PORT', '9197') %>"
+    DB_PATH: "/data/broker.db"
+    PROMPTS_DIR: "/app/prompts"
+    ENABLE_SYNC: "<%= ENV.fetch('ENABLE_SYNC', 'true') %>"
+    ENABLE_ASYNC: "<%= ENV.fetch('ENABLE_ASYNC', 'true') %>"
+    # Absolute base the broker stamps into capability poll_urls it hands to agents.
+    # Must be the PUBLIC url clients can reach, or pollers will chase an internal one.
+    # Optional: left empty, urls are derived per-request (see BROKER_TRUST_FORWARDED).
+    BROKER_PUBLIC_URL: "<%= ENV['BROKER_PUBLIC_URL'] %>"
+    # Behind a reverse proxy the request arrives as plain HTTP; trusting
+    # X-Forwarded-Proto/Host keeps generated urls on https when BROKER_PUBLIC_URL
+    # is not pinned. Only enable it when a proxy you control sets those headers.
+    BROKER_TRUST_FORWARDED: "<%= ENV.fetch('BROKER_TRUST_FORWARDED', 'true') %>"
+  secret:
+    # Master bearer token for /rpc + /admin. Value comes from .kamal/secrets → .env.
+    - API_KEY
+
+# The account Kamal ssh's in as. No default on purpose: a hardcoded one would be a
+# guess about someone else's server, and this file is public. Set it in .env.
+ssh:
+  user: <%= ENV['KAMAL_SSH_USER'] %>
+
+# Shorthands for the commands used daily. Kamal exposes each as a top-level verb, so
+# they work both as `kamal logs` and through the Makefile's `make kamal logs`.
+#
+# --reuse is the load-bearing flag in the last two: without it kamal starts a FRESH
+# container, whose /data is an empty volume mount rather than the live database.
+aliases:
+  logs: app logs -f
+  shell: app exec --interactive --reuse "sh"
+  # Read-only SQL; the statement arrives on stdin:
+  #   echo "SELECT status, count(*) FROM tasks GROUP BY status;" | kamal sql
+  # Writes need the container stopped first — a second writer will fail on SQLite's
+  # lock; treat schema changes as a deploy, not an exec.
+  sql: app exec --interactive --reuse "sqlite3 -readonly /data/broker.db"

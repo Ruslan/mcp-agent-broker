@@ -155,19 +155,24 @@ func main() {
 }
 
 // AuthMiddleware gates the command surface with the master API_KEY (when set),
-// exactly as before — EXCEPT two non-secret surfaces. GET /poll/{token}
+// exactly as before — EXCEPT three non-secret surfaces. GET /poll/{token}
 // self-authenticates via the unguessable token in its path, so a background
 // `curl "$poll_url"` (which carries no Authorization header) must reach it
 // without the master key. GET /skill/install serves the embedded, open-source
 // installer scripts and must be `wget`-able by a harness with no credential.
-// Both are deliberately not behind the command-channel credential.
+// GET /health is the liveness probe: orchestrators (kamal-proxy, Docker
+// HEALTHCHECK, a load balancer) poll it with no credential, and gating it would
+// mean a deploy never goes healthy once API_KEY is set. Its body carries only
+// version, protocol version and the two feature flags — no secrets, no data.
+// All three are deliberately not behind the command-channel credential.
 func AuthMiddleware(apiKey string, next http.Handler) http.Handler {
 	const prefix = "Bearer "
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Capability-URL poll endpoint: token-in-path is the authorization.
 		// Skill installer: non-secret embedded scripts, served for harnesses
-		// that can't pull MCP prompts. Both bypass the master key.
-		if strings.HasPrefix(r.URL.Path, "/poll/") || strings.HasPrefix(r.URL.Path, "/skill/") {
+		// that can't pull MCP prompts. Health: unauthenticated liveness probe.
+		// All three bypass the master key.
+		if r.URL.Path == "/health" || strings.HasPrefix(r.URL.Path, "/poll/") || strings.HasPrefix(r.URL.Path, "/skill/") {
 			next.ServeHTTP(w, r)
 			return
 		}

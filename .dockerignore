@@ -1,0 +1,14 @@
+# Keep the build context small and free of anything local. Without this the whole
+# repo — .git, ui/node_modules, the live SQLite database — is shipped to the daemon
+# on every build.
+.git
+.env
+data/
+task-data*/
+ui/node_modules/
+ui/dist/
+agent-broker/dist/
+broker
+*.log
+coverage.out
+coverage.html

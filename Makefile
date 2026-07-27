@@ -1,3 +1,15 @@
+# `make kamal <words>` (see the Kamal section at the bottom) hands <words> to kamal.
+# Make parses those words as additional GOALS, and a goal that names a real target
+# here would FIRE it: `make kamal deploy` would deploy twice, `make kamal build push`
+# would rebuild the Svelte UI on the way. A catch-all rule can't prevent that —
+# explicit rules beat pattern rules. So during that one invocation this Makefile
+# defines nothing but the kamal target, and the stray words get a no-op rule there.
+ifeq (kamal,$(firstword $(MAKECMDGOALS)))
+kamal-passthru := 1
+endif
+
+ifndef kamal-passthru
+
 .PHONY: build run test clean ui-build sync-skillfiles systemd-install systemd-restart systemd-status systemd-logs systemd-stop
 
 # Regenerate the install copy of the broker-async-poll skill from the canonical
@@ -79,3 +91,64 @@ systemd-logs:
 
 systemd-stop:
 	sudo systemctl stop $(SERVICE)
+
+endif # kamal-passthru
+
+# --- Kamal (Docker) deploy ---------------------------------------------------
+.PHONY: kamal
+# The alternative to the systemd recipe above: build an image and run the broker
+# as a Docker container behind kamal-proxy, with SQLite on a persistent volume.
+# Full walkthrough: deploy/README-kamal.md.
+#
+# Everything goes through ONE target, `make kamal <words>`, which loads .env and
+# hands <words> to kamal. Kamal does NOT read .env itself, and without it
+# config/deploy.yml's ERB lookups and .kamal/secrets resolve empty — kamal then
+# fails with a confusing "servers/web/0". Nothing deployment-specific is
+# committed: put your server, domain and keys in .env.
+KAMAL ?= kamal
+ENVFILE ?= .env
+# Run a kamal subcommand with .env exported. `set -a` marks every assignment for
+# export; the subshell keeps it out of the other targets.
+kamal-run = @[ -f $(ENVFILE) ] || { echo "!! $(ENVFILE) missing — cp .env.example .env and fill it in"; exit 1; }; \
+	set -a; . ./$(ENVFILE); set +a; \
+	[ -n "$$KAMAL_SERVER_IP" ] || { echo "!! KAMAL_SERVER_IP unset in $(ENVFILE)"; exit 1; }; \
+	[ -n "$$BROKER_HOST" ]     || { echo "!! BROKER_HOST unset in $(ENVFILE)"; exit 1; }; \
+	[ -n "$$KAMAL_SSH_USER" ]  || { echo "!! KAMAL_SSH_USER unset in $(ENVFILE)"; exit 1; }; \
+	[ -n "$$KAMAL_REGISTRY_SERVER" ] || { echo "!! KAMAL_REGISTRY_SERVER unset in $(ENVFILE)"; exit 1; }; \
+	command -v $(KAMAL) >/dev/null || { echo "!! kamal not on PATH — install it or: make kamal deploy KAMAL=/path/to/kamal"; exit 1; }; \
+	$(KAMAL)
+
+# Any kamal command, with .env loaded — the words after `kamal` are passed through:
+#
+#   make kamal deploy          make kamal config        make kamal rollback
+#   make kamal app details     make kamal proxy reboot  make kamal accessory boot db
+#
+# Options can NOT be typed bare: make parses the command line before the recipe
+# runs and swallows a leading `-` itself (`-f` even demands a makefile after it).
+# Put them in ARGS, which replaces the words entirely:
+#
+#   make kamal ARGS="app logs -n 200 --grep=poll"
+#
+# The daily commands that only exist to carry options are Kamal ALIASES, declared
+# under `aliases:` in config/deploy.yml rather than wrapped here — that way they
+# work from a raw `kamal` invocation too, and this target stays a plain conduit:
+#
+#   make kamal logs     make kamal shell     echo "SELECT …;" | make kamal sql
+kamal:
+	$(kamal-run) $(if $(ARGS),$(ARGS),$(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS)))
+
+# `make kamal app details` asks make to build three goals: kamal, app, details.
+# Only the first is real — give each of the others an empty recipe. Two details
+# earn their keep here:
+#   .PHONY, because some of these words name real files — `make kamal config`
+#   finds the config/ directory and would report it up to date instead;
+#   an explicit rule rather than a `%:` catch-all, because make skips implicit
+#   rules for phony targets and would answer "Nothing to be done" for every word.
+ifdef kamal-passthru
+kamal-strays := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+ifneq ($(kamal-strays),)
+.PHONY: $(kamal-strays)
+$(kamal-strays):
+	@:
+endif
+endif

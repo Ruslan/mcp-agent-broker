@@ -66,3 +66,36 @@ func TestAuthMiddleware(t *testing.T) {
 		})
 	}
 }
+
+// TestHealthEndpointUnauthenticated: /health must answer with NO credential even
+// when API_KEY is set. Deploy orchestrators (kamal-proxy, Docker HEALTHCHECK, a
+// load balancer) probe it anonymously; gating it would make every deploy time out
+// waiting for a container that is actually up. Load-bearing — see AuthMiddleware.
+func TestHealthEndpointUnauthenticated(t *testing.T) {
+	reached := false
+	dummyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := AuthMiddleware("secret", dummyHandler)
+	req := httptest.NewRequest("GET", "/health", nil) // deliberately no Authorization
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("GET /health with no credential: expected 200, got %d", rr.Code)
+	}
+	if !reached {
+		t.Error("GET /health did not reach the wrapped handler — the auth exemption is gone")
+	}
+
+	// The exemption is an exact path match: it must NOT open a /health* prefix.
+	for _, path := range []string{"/healthz", "/health/secrets", "/healthy"} {
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, httptest.NewRequest("GET", path, nil))
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("%s with no credential: expected 401, got %d", path, rr.Code)
+		}
+	}
+}
