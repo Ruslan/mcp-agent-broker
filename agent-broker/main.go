@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -59,7 +60,70 @@ func loadDotEnv() {
 	}
 }
 
+// usageText documents the ONLY interface this binary has: the environment. It is
+// printed on --help and on any unrecognized argument.
+const usageText = `agent-broker — task broker for AI agents (MCP over JSON-RPC).
+
+Usage:
+  broker              start the server (no arguments — it is configured by the environment)
+  broker --help       print this text and exit
+  broker --version    print the version and exit
+
+Starting the server binds a TCP port and creates the SQLite database relative to the
+CURRENT DIRECTORY unless DB_PATH is absolute — run it from the repo root, or set the
+variables below.
+
+Environment:
+  PORT                    listen port (default 9197)
+  DB_PATH                 SQLite file (default data/broker.db, created if missing)
+  PROMPTS_DIR             directory of role prompt files (default prompts)
+  API_KEY                 bearer token for /rpc and /admin; EMPTY MEANS NO AUTH.
+                          GET /health, /poll/{token} and /skill/install stay open.
+  ENABLE_SYNC             sync tools: await_task, listen_role wait (default true)
+  ENABLE_ASYNC            async tools: capability poll urls (default true)
+  BROKER_PUBLIC_URL       absolute base url stamped into poll urls handed to agents
+  BROKER_TRUST_FORWARDED  trust X-Forwarded-Host when deriving urls (default false)
+
+A .env file in the current directory is loaded first; real environment variables win.
+
+Endpoints:
+  POST /rpc             JSON-RPC (MCP)      GET /admin/          admin UI
+  GET  /health          liveness probe      GET /poll/{token}    capability poll url
+  GET  /skill/install   installer scripts
+`
+
+// parseArgs decides whether main should boot a server. The broker takes no
+// positional arguments and no flags — every setting comes from the environment —
+// so anything on the command line is either a request for help or a mistake.
+//
+// Load-bearing: this used to be absent, and the binary ignored its arguments
+// entirely. `broker --help`, the first thing anyone types to orient themselves,
+// therefore booted a full server: it bound port 9197 and created a stray database
+// in whatever directory the caller happened to be in. Exiting non-zero on an
+// unknown argument is what keeps a typo from silently starting a second broker.
+func parseArgs(args []string, stdout, stderr io.Writer) (exitCode int, stop bool) {
+	if len(args) == 0 {
+		return 0, false
+	}
+	switch args[0] {
+	case "-h", "--help", "help":
+		fmt.Fprint(stdout, usageText)
+		return 0, true
+	case "-v", "--version", "version":
+		fmt.Fprintf(stdout, "agent-broker %s (MCP protocol %s)\n", ServerVersion, ProtocolVersion)
+		return 0, true
+	default:
+		fmt.Fprintf(stderr, "broker: unrecognized argument %q\n\n", args[0])
+		fmt.Fprint(stderr, usageText)
+		return 2, true
+	}
+}
+
 func main() {
+	if code, stop := parseArgs(os.Args[1:], os.Stdout, os.Stderr); stop {
+		os.Exit(code)
+	}
+
 	loadDotEnv()
 
 	port := os.Getenv("PORT")

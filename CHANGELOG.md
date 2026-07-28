@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-28
+
+- `broker --help` now prints usage and exits instead of **starting the server**. The binary ignored
+  its command line entirely, so the one command anyone types to orient themselves bound port 9197 and
+  created a SQLite database in the caller's current directory — a stray broker that looks alive from
+  the outside but holds no tasks. `--version` was added alongside it, and any other argument now exits
+  `2` with usage on stderr, so a typo cannot start a second broker. Configuration is unchanged: the
+  environment is still the only interface, which is exactly why an argument is never valid.
+
 ## 2026-07-21
 
 - `poll_url` now honors `X-Forwarded-Proto` **by default** (no `BROKER_TRUST_FORWARDED` needed), so a
