@@ -2,7 +2,7 @@
 # repo — .git, ui/node_modules, the live SQLite database — is shipped to the daemon
 # on every build.
 .git
-.env
+.env*
 data/
 task-data*/
 ui/node_modules/
