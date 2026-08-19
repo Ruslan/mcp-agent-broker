@@ -30,6 +30,14 @@ proxy:
   ssl: <%= ENV.fetch('BROKER_PROXY_SSL', 'true') %>
   host: <%= ENV['BROKER_HOST'] %>
   app_port: <%= ENV.fetch('PORT', '9197') %>
+  # kamal-proxy's --target-timeout, i.e. how long it waits for the app to produce a
+  # response before returning its own 504 page. The default is 30s, which is FATAL
+  # here: the capability poll endpoint (/poll/…) and listen_role/await_task are
+  # long-polls that legitimately hold a connection open for many minutes. At 30s the
+  # proxy killed them and clients saw a 504 HTML page instead of a task — retrying in
+  # a hot loop. Keep this >= the longest long-poll the broker will hold, and in sync
+  # with any upstream reverse proxy timeout.
+  response_timeout: 3600
   # GET /health is unauthenticated by design (see AuthMiddleware) precisely so this
   # check works — with API_KEY set, an authenticated path would 401 and the deploy
   # would never go healthy.
