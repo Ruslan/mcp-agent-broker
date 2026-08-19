@@ -1,5 +1,12 @@
 # Agent Task Broker — Plan
 
+> **Historical document.** This is the original in-memory prototype plan and no
+> longer describes the running system. The implementation now uses SQLite,
+> generated task IDs, immediate `create_task`, sync and async worker modes,
+> capability poll URLs, prompts, and an embedded admin UI. Use
+> [`codebase-overview.md`](codebase-overview.md) and the repository
+> [`README.md`](../../README.md) as the current source of truth.
+
 ## What to Build
 
 An HTTP server in **pure Go** (stdlib only, zero external dependencies) that acts as a coordination layer between AI agents. Agents communicate via **JSON-RPC 2.0 over HTTP**.

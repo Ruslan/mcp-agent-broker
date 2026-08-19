@@ -71,6 +71,7 @@ The current API is based on a small task lifecycle:
 4. `list_tasks`
 5. `get_task`
 6. `solve_task`
+7. `progress_task` (optional intermediate updates)
 
 ## Repository Layout
 
@@ -80,6 +81,9 @@ The current API is based on a small task lifecycle:
 ├── ui/                         # Svelte 5 admin dashboard (sources)
 ├── data/                       # Runtime data directory
 ├── docs/dev/                   # Version plans and design notes
+├── docs/bugs/                  # Open defect cards and backlog index
+├── deploy/                     # systemd and Kamal deployment files
+├── extensions/pi/              # Experimental Pi broker-queue extension
 ├── examples/ralph-simple/      # Example role prompts
 ├── Makefile
 └── README.md
@@ -87,8 +91,8 @@ The current API is based on a small task lifecycle:
 
 ## Prerequisites
 
-- **Go** 1.22+
-- **Node.js** 18+ and **npm** (for building the admin UI)
+- **Go** 1.25.5+ (the minimum declared by `agent-broker/go.mod`)
+- **Node.js** `^20.19.0` or `>=22.12.0` and **npm** (required by Vite 8)
 - **Make** (optional, for convenience targets)
 
 ## Core Concepts
@@ -154,6 +158,14 @@ Admin UI (browser):
 http://localhost:9197/admin/
 ```
 
+Other HTTP surfaces:
+
+| Method | Path | Authentication | Description |
+|--------|------|----------------|-------------|
+| `GET` | `/health` | Open in the broker | Liveness and version information |
+| `GET` | `/poll/:token` | Token in URL | Async role/task capability polling |
+| `GET` | `/skill/install` | Open in the broker | Embedded async-poller skill installer |
+
 Admin REST API:
 
 | Method | Path | Description |
@@ -188,6 +200,24 @@ Supported environment variables:
    Caddy/nginx emits `https://` `poll_url`s automatically, with no config and no hardcoded domain.
 
 At least one of `ENABLE_SYNC` or `ENABLE_ASYNC` must stay enabled.
+
+### Authentication and reverse proxies
+
+When `API_KEY` is set, the broker expects `Authorization: Bearer <key>` on
+`/rpc` and `/admin`. The current browser SPA does not prompt for that bearer
+key, so a public deployment normally puts browser-friendly authentication such
+as Basic Auth on a trusted reverse proxy.
+
+If the proxy is the sole authentication boundary, protect both `/rpc` and
+`/admin`, and do not expose the broker port directly. Keep `/poll/` and
+`/skill/install` outside proxy authentication: poll URLs are self-authorizing
+capabilities, while the installer is intentionally public. Decide separately
+whether external `/health` should be public; the broker itself leaves it open so
+container and load-balancer health checks work.
+
+If `API_KEY` remains enabled behind the proxy, the proxy must pass a valid Bearer
+header upstream. A browser's Basic Authorization header does not satisfy the
+broker middleware by itself.
 
 ## Async pollers (keep working, get woken)
 
@@ -422,6 +452,20 @@ Arguments:
 }
 ```
 
+### `progress_task`
+
+Appends a short intermediate update without completing the task. Messages are
+persisted in the task progress log and may be reported by `await_task`.
+
+```json
+{
+  "task_id": "...",
+  "message": "tests pass; reviewing the migration"
+}
+```
+
+The message limit is 500 characters.
+
 ## Typical Flows
 
 ### Sync Orchestrator Flow
@@ -468,8 +512,8 @@ See `examples/ralph-simple/` for example prompts for:
 
 ### Prerequisites
 
-- Go 1.22+
-- Node.js 18+ / npm
+- Go 1.25.5+
+- Node.js `^20.19.0` or `>=22.12.0` / npm
 
 ### Build
 
@@ -492,12 +536,24 @@ cd agent-broker
 go test -count=1 ./...
 ```
 
+Race and static checks:
+
+```bash
+cd agent-broker
+go test -race ./...
+go vet ./...
+```
+
+`make test` is intended to be the repository-wide entry point, but it currently
+references an integration script that is absent from the Git tree. Until
+[BUG-004](docs/bugs/bug-004-make-test-missing-integration-script.md) is resolved,
+run the Go commands above plus `make ui-build`.
+
 ### Extra checks
 
 ```bash
 cd agent-broker
 go build ./...
-go vet ./...
 ```
 
 ### UI development
@@ -511,3 +567,8 @@ npm run dev
 ```
 
 The Vite dev server proxies are not configured — this is for iterating on the UI only. For a full integration test, use `make build && make run`.
+
+## Known defects
+
+Open defects and their acceptance criteria are tracked as one Markdown file per
+issue in [`docs/bugs/`](docs/bugs/README.md).

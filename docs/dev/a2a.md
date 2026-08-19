@@ -1,5 +1,11 @@
 # A2A Protocol Support
 
+> **Status: proposed and not implemented.** This document predates the current
+> async `poll_url` flow and should be revalidated against the A2A specification
+> before implementation. In particular, `progress_task` now exists, despite
+> several phase-2 notes below treating it as future work. For the implemented
+> broker surface, see [`codebase-overview.md`](codebase-overview.md).
+
 Plan for adding [Agent2Agent (A2A) protocol](https://a2aproject.github.io/A2A/) support to agent-broker, enabling gemini-cli and other A2A-compatible orchestrators to delegate tasks to the broker.
 
 ## Goal

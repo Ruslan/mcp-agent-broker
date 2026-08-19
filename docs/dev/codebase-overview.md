@@ -1,107 +1,181 @@
 # Codebase Overview
 
-Generated 2026-05-23. Update when architecture changes significantly.
+Updated 2026-08-19. Update this document whenever the runtime architecture,
+storage schema, or public HTTP surface changes significantly.
 
-## Directory Structure
+## Directory structure
 
-```
+```text
 .
-├── agent-broker/               # Go backend binary + source
-│   ├── main.go                 # Entrypoint: server, routing, auth middleware
-│   ├── broker.go               # Core task broker logic (create/listen/solve/await)
-│   ├── store.go                # Storage abstraction + SQLite implementation
-│   ├── admin.go                # Admin REST API handler (tasks, projects, prompts, SSE)
-│   ├── admin_embed.go          # Embeds compiled UI dist/ into Go binary
-│   ├── jsonrpc.go              # JSON-RPC 2.0 handler (MCP protocol)
-│   ├── go.mod / go.sum
-│   ├── dist/                   # Compiled Svelte frontend (embedded at build time)
+├── agent-broker/               # Go server, embedded assets, scripts, and tests
+│   ├── main.go                 # Entrypoint, routes, environment, auth middleware
+│   ├── broker.go               # Task lifecycle, queues, listeners, prompts, SSE fanout
+│   ├── store.go                # Store interface and SQLite implementation
+│   ├── jsonrpc.go              # MCP-compatible JSON-RPC handler and tools
+│   ├── pollhandler.go          # GET /poll/{token} capability endpoint
+│   ├── skillhttp.go            # GET /skill/install
+│   ├── skillfiles_embed.go     # Embedded poller scripts and installer body
+│   ├── skillfiles/             # Canonical async-poller skill sources
+│   ├── admin.go                # Admin REST API and SSE endpoint
+│   ├── admin_embed.go          # Embedded compiled Svelte UI
 │   └── *_test.go
-├── ui/                         # Svelte 5 frontend source
-│   ├── src/
-│   │   ├── App.svelte          # Single-page admin UI component
-│   │   ├── main.js             # Svelte mount entry
-│   │   └── app.css             # Global styles (PicoCSS + dark theme)
-│   ├── index.html
-│   ├── package.json            # deps: svelte, vite, marked, dompurify, picocss
-│   ├── vite.config.js
-│   └── svelte.config.js
-├── data/                       # SQLite database (runtime)
-├── docs/dev/                   # Design docs and version plans
-├── examples/ralph-simple/
-├── prompts/                    # Built-in prompt templates
-├── Makefile                    # build, run, test, clean, ui-build targets
-└── README.md
+├── ui/                         # Svelte 5 admin dashboard source
+├── prompts/                    # MCP prompt templates loaded from disk
+├── extensions/pi/broker-queue/ # Experimental Pi integration
+├── examples/ralph-simple/      # Sync and async role examples
+├── deploy/                     # Dockerfile and systemd/Kamal documentation
+├── config/deploy.yml           # Kamal 2 deployment configuration
+├── docs/dev/                   # Historical plans and forward-looking designs
+├── docs/bugs/                  # One Markdown card per open defect
+├── data/                       # Runtime SQLite location for local/systemd use
+└── Makefile
 ```
 
-## Architecture
+## Runtime architecture
 
-- **Backend**: Single Go binary serving JSON-RPC 2.0 (MCP protocol), REST admin API, SSE events, and embedded Svelte SPA.
-- **Frontend**: Svelte 5 SPA compiled to static files, embedded via Go `embed.FS` at build time (`make ui-build`).
-- **Database**: SQLite via `modernc.org/sqlite` (pure Go, WAL mode, in `data/broker.db`).
+- **Process:** one Go binary serves MCP/JSON-RPC, the admin REST API, admin SSE,
+  capability polling, the skill installer, health checks, and the embedded SPA.
+- **State:** task metadata, results, progress, and poll capabilities are persisted
+  in SQLite. Active tasks, per-role queues, blocking listeners, and SSE subscribers
+  also have in-memory representations.
+- **Recovery:** queued and picked tasks are loaded from SQLite at startup. Queued
+  tasks return to their role queues; picked tasks stay addressable for a worker to
+  solve or for an administrator to requeue.
+- **Frontend:** Svelte 5 compiles to `ui/dist`, which `make ui-build` copies to the
+  gitignored `agent-broker/dist` directory before Go embeds it.
+- **Deployment:** systemd runs the binary directly. Kamal builds a three-stage
+  Node → Go → Alpine image and mounts SQLite on a persistent named volume.
 
-## Database Schema
+## Task lifecycle
 
-### Table: `tasks`
+```text
+queued --listen_role/poll--> picked --solve_task--> solved
+   ^                              |
+   └--------- admin requeue ------┘
+```
 
-| Column     | Type | Notes                       |
-|------------|------|-----------------------------|
-| project_id | TEXT | NOT NULL                    |
-| task_id    | TEXT | NOT NULL                    |
-| role       | TEXT | NOT NULL                    |
-| title      | TEXT | NOT NULL                    |
-| status     | TEXT | DEFAULT 'queued'            |
-| task_md    | TEXT | NOT NULL                    |
-| result_md  | TEXT | NULL until solved           |
-| created_at | TEXT | RFC3339                     |
-| updated_at | TEXT | RFC3339                     |
+`create_task` always returns immediately. A dispatcher can use blocking
+`await_task`, periodically call `get_task`, or arm the task's capability
+`poll_url`. Workers use `listen_role` in blocking `wait` mode or asynchronous
+`poll` mode. `progress_task` persists intermediate worker messages.
 
-PRIMARY KEY (project_id, task_id)
+The latest forward-looking design is
+[`plan-0.0.14.md`](plan-0.0.14.md): mid-task dispatcher-to-worker steering. It is
+proposed and not implemented.
 
-INDEXES: `idx_tasks_project_role`, `idx_tasks_project_status`
+## Database schema
 
-### Table: `task_progress`
+SQLite is opened through `modernc.org/sqlite`, with WAL mode and one open
+connection to serialize writes.
 
-| Column     | Type    | Notes                              |
-|------------|---------|------------------------------------|
-| project_id | TEXT    | NOT NULL                           |
-| task_id    | TEXT    | NOT NULL                           |
-| sequence   | INTEGER | PRIMARY KEY AUTOINCREMENT          |
-| message    | TEXT    | NOT NULL                           |
-| created_at | TEXT    | NOT NULL                           |
+### `tasks`
 
-FOREIGN KEY (project_id, task_id) REFERENCES tasks ON DELETE CASCADE
+| Column | Type | Notes |
+|--------|------|-------|
+| `project_id` | TEXT | Composite primary key; tenant boundary |
+| `task_id` | TEXT | Composite primary key |
+| `role` | TEXT | Worker queue name |
+| `title` | TEXT | Maximum 200 characters at broker validation |
+| `status` | TEXT | `queued`, `picked`, or `solved` |
+| `task_md` | TEXT | Original task body |
+| `result_md` | TEXT | Nullable until solved |
+| `created_at` | TEXT | RFC3339 UTC |
+| `updated_at` | TEXT | RFC3339 UTC |
+| `result_view_count` | INTEGER | Number of result reads through client paths |
 
-## API Endpoints
+Indexes: `idx_tasks_project_role`, `idx_tasks_project_status`.
+
+### `task_progress`
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `project_id` | TEXT | Task tenant |
+| `task_id` | TEXT | Task ID |
+| `sequence` | INTEGER | Autoincrement primary key and ordering cursor |
+| `message` | TEXT | Progress text, max 500 characters at RPC validation |
+| `created_at` | TEXT | RFC3339 UTC |
+
+The table declares a composite foreign key to `tasks` with `ON DELETE CASCADE`.
+Foreign-key enforcement is not currently enabled; see
+[`BUG-003`](../bugs/bug-003-sqlite-foreign-keys-disabled.md).
+
+### `poll_tokens`
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `token` | TEXT | Primary key; 32 random bytes encoded as hex |
+| `project_id` | TEXT | Scope tenant |
+| `scope_kind` | TEXT | `role` or `task` |
+| `scope_value` | TEXT | Role name or task ID |
+| `created_at` | TEXT | Used for the hard lifetime cap |
+| `expires_at` | TEXT | Sliding expiry |
+
+Poll tokens have an approximately 30-minute sliding TTL and a hard 24-hour
+lifetime. Active tokens are reused per scope while enough lifetime remains.
+
+## HTTP surface
+
+| Method | Path | Purpose | Broker authentication |
+|--------|------|---------|-----------------------|
+| `POST` | `/rpc` | MCP / JSON-RPC | Bearer `API_KEY` when configured |
+| `GET` | `/health` | Liveness, version, flags | Open |
+| `GET` | `/poll/{token}` | Role pick or task-result poll | Capability token in path |
+| `GET` | `/skill/install` | Embedded poller skill | Open |
+| `GET` | `/admin/` | Embedded SPA | Bearer `API_KEY` when configured |
+| various | `/admin/api/*` | Projects, tasks, prompts | Bearer `API_KEY` when configured |
+| `GET` | `/admin/events` | `task_update` SSE stream | Bearer `API_KEY` when configured |
+
+An outer reverse proxy may add browser-friendly Basic Auth, but must preserve the
+open capability and installer paths. See
+[`deploy/README-kamal.md`](../../deploy/README-kamal.md#browser-admin-authentication).
 
 ### Admin REST API
 
-| Method | Path                       | Handler          |
-|--------|----------------------------|------------------|
-| GET    | /admin/api/projects        | listProjects     |
-| GET    | /admin/api/tasks           | listTasks        |
-| GET    | /admin/api/tasks/:id       | getTask          |
-| PATCH  | /admin/api/tasks/:id       | updateTaskStatus |
-| DELETE | /admin/api/tasks/:id       | deleteTask       |
-| GET    | /admin/api/prompts         | listPrompts      |
-| GET    | /admin/api/prompts/:name   | getPrompt        |
-| GET    | /admin/events              | SSE task_update  |
+| Method | Path | Handler |
+|--------|------|---------|
+| `GET` | `/admin/api/projects` | `listProjects` |
+| `GET` | `/admin/api/tasks` | `listTasks` with filters and pagination |
+| `GET` | `/admin/api/tasks/:id` | `getTask` |
+| `PATCH` | `/admin/api/tasks/:id` | `updateTaskStatus` |
+| `DELETE` | `/admin/api/tasks/:id` | `deleteTask` |
+| `GET` | `/admin/api/prompts` | `listPrompts` |
+| `GET` | `/admin/api/prompts/:name` | `getPrompt` |
+| `GET` | `/admin/events` | SSE `task_update` |
 
-### JSON-RPC API (all at POST /rpc)
+### MCP tools
 
-| tool name           | Description                        |
-|---------------------|------------------------------------|
-| list_tasks          | Up to 20 StatusMetadata, filtered  |
-| get_task            | Full task details + result         |
-| create_task         | Creates task, returns task_id      |
-| solve_task          | Submit result, transition to solved|
-| await_task          | Block until solved/timeout         |
-| listen_role         | Worker pick-up (wait/poll)         |
-| progress_task       | Append progress message            |
+| Tool | Availability | Purpose |
+|------|--------------|---------|
+| `create_task` | Always | Create and queue a task; returns task `poll_url` when possible |
+| `await_task` | `ENABLE_SYNC` | Block until solve, timeout, or cancellation |
+| `listen_role` | Always | Worker pickup; allowed modes depend on feature flags |
+| `list_tasks` | Always | Return up to 20 recent metadata records |
+| `get_task` | Always | Context-efficient task or result lookup |
+| `solve_task` | Always | Store the final result |
+| `progress_task` | Always | Append an intermediate progress message |
 
-## Go Source Files (key types)
+The server also exposes MCP `prompts/list` and `prompts/get`. The synthetic
+`skill-install` prompt returns the same installer body as `/skill/install`.
 
-- `broker.go` — `TaskStatus`, `StatusMetadata`, `Task` struct, `Broker` core logic.
-- `store.go` — `Store` interface, `SQLiteStore` implementation.
-- `admin.go` — `AdminHandler`, all REST endpoints.
-- `jsonrpc.go` — `JSONRPCHandler`, tool call dispatch.
-- `main.go` — Server setup, routing, auth middleware.
+## Configuration
+
+The binary reads `PORT`, `DB_PATH`, `PROMPTS_DIR`, `API_KEY`, `ENABLE_SYNC`,
+`ENABLE_ASYNC`, `BROKER_PUBLIC_URL`, and `BROKER_TRUST_FORWARDED`. A `.env` file
+in the working directory is loaded first, while non-empty process environment
+values take precedence.
+
+At least one of sync or async mode must be enabled. `X-Project-Id` selects the
+tenant for MCP and health requests; blank values use `default`.
+
+## Build and verification
+
+- Go module minimum: Go 1.25.5.
+- UI toolchain: Node `^20.19.0` or `>=22.12.0` (Vite 8).
+- `make build` builds and embeds the UI, then compiles `./broker`.
+- `go test ./...`, `go test -race ./...`, and `go vet ./...` currently pass in
+  `agent-broker/`.
+- `make test` is currently broken after the Go suite because its referenced
+  integration script is missing; see
+  [`BUG-004`](../bugs/bug-004-make-test-missing-integration-script.md).
+
+Open defects are indexed in [`docs/bugs/README.md`](../bugs/README.md).

@@ -10,5 +10,6 @@ See [docs/dev/codebase-overview.md](docs/dev/codebase-overview.md) for architect
 make ui-build      # Build frontend (Svelte → agent-broker/dist/)
 make build         # Build Go binary
 make run           # Run broker locally
-make test          # Run Go tests
+make test          # Intended full suite; see docs/bugs/bug-004-make-test-missing-integration-script.md
+(cd agent-broker && go test ./...)  # Current passing Go suite
 ```

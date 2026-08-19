@@ -131,20 +131,31 @@ exemption is load-bearing:
 - `GET /skill/install` — the non-secret installer scripts, fetched by harnesses that
   have no credential yet.
 
-## Known limitation — the admin UI and `API_KEY`
+## Browser admin authentication
 
-The admin UI is a plain SPA that sends no `Authorization` header, so **with `API_KEY`
-set the browser gets 401 on `/admin/`**. On a public deployment that leaves two
-honest options today:
+The admin SPA does not have a built-in login form and cannot supply the broker's
+`Authorization: Bearer <API_KEY>` header. There are two practical deployment
+patterns:
 
-- keep `API_KEY` set (so `/rpc` is protected) and reach the admin UI through an SSH
-  tunnel to the container port rather than over the public domain; or
-- put an additional credential (basic auth) on `/admin/` at the reverse proxy in
-  front of Kamal.
+1. Keep `API_KEY` enabled and access `/admin/` through a trusted tunnel, or configure
+   a reverse proxy that supplies the Bearer header upstream after authenticating the
+   browser.
+2. Use the outer reverse proxy as the sole command-surface authentication boundary.
+   Protect both `/rpc` and `/admin`, leave `API_KEY` empty inside the container, and
+   ensure port 9197 is not reachable except through that proxy.
 
-Leaving `API_KEY` empty to make the UI reachable would also un-gate `/rpc` — do not
-do that on a public host. Giving the UI a browser-friendly login is the proper fix
-and has not been built yet.
+Basic Auth at an outer Caddy/nginx proxy is a valid implementation of the second
+pattern. Scope its matchers carefully:
+
+- `/rpc` and `/admin` must be protected;
+- `/poll/*` must remain open because the unguessable poll token is the credential;
+- `/skill/install` must remain open because agents fetch it without credentials;
+- `/health` may be open for external monitoring or restricted externally, but the
+  internal Kamal healthcheck must still reach it without credentials.
+
+Do not assume that a successful Basic Auth exchange automatically satisfies the
+broker's `API_KEY`: unless the proxy explicitly rewrites the upstream header, the
+broker accepts Bearer authentication only.
 
 ## Choosing between systemd and Kamal
 
