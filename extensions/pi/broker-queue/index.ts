@@ -10,6 +10,7 @@ type ActiveTask = {
   taskId: string;
   taskMd: string;
   instructions: InstructionKind;
+  workToken?: string;
 };
 
 function firstPickedTask(payload: any): { taskId: string; taskMd?: string; role?: string } | null {
@@ -310,6 +311,29 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("cprogress", {
+    description: "Report progress for the current task",
+    handler: async (args, ctx) => {
+      if (!activeTask) {
+        ctx.ui.notify("No active task", "warning");
+        return;
+      }
+      const message = (args || "").trim();
+      if (!message) {
+        ctx.ui.notify("Usage: /cprogress <message>", "warning");
+        return;
+      }
+      try {
+        const broker = await brokerReady;
+        await broker.ensureInitialized();
+        await broker.progressTask(activeTask.taskId, message, activeTask.workToken);
+        ctx.ui.notify(`Progress sent for ${activeTask.taskId}`, "info");
+      } catch (e: any) {
+        ctx.ui.notify(`Failed to submit progress: ${e?.message || e}`, "error");
+      }
+    },
+  });
+
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
     if (!activeTask) return;
@@ -330,7 +354,7 @@ export default function (pi: ExtensionAPI) {
     try {
       const broker = await brokerReady;
       await broker.ensureInitialized();
-      await broker.solveTask(solution.taskId, solution.resultMd);
+      await broker.solveTask(solution.taskId, solution.resultMd, activeTask.workToken);
       ctx.ui.notify(`Solved task ${solution.taskId}`, "info");
       activeTask = null;
 

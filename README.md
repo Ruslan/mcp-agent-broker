@@ -62,6 +62,15 @@ Or in `.mcp.json` at the project root:
 Pi does not currently support MCP directly, but this repository includes an experimental extension in `extensions/pi/broker-queue/` that connects Pi to the broker queue workflow through the MCP endpoint without stuffing broker protocol details into the main chat context. The Pi extension is currently being tested.
 
 For multi-project usage, send `X-Project-Id` on requests so task queues stay isolated per project.
+When several projects use the same broker and intentionally share a worker queue, address it as
+`g:<key>:<queue>` (for example `g:shared-lib:maintainer`). The complete role is routed globally while
+the task remains owned and visible only under its creator's project. A global worker receives an
+opaque `work_token` with the task and must return it in `progress_task` and `solve_task`; local roles
+remain token-free and project-local. `<key>` is a namespace label, not a secret or an ACL—broker
+authentication is still the security boundary. Global queues do not span separate broker instances.
+An admin requeue does not revoke an already issued work token; it remains valid until its fixed
+expiry (unless the task is deleted). Requeue is therefore retry/routing control, not a worker lease
+revocation mechanism.
 
 The current API is based on a small task lifecycle:
 
@@ -82,6 +91,7 @@ The current API is based on a small task lifecycle:
 ├── data/                       # Runtime data directory
 ├── docs/dev/                   # Version plans and design notes
 ├── docs/bugs/                  # Open defect cards and backlog index
+├── docs/tasks/                 # Feature task cards and backlog index
 ├── deploy/                     # systemd and Kamal deployment files
 ├── extensions/pi/              # Experimental Pi broker-queue extension
 ├── examples/ralph-simple/      # Example role prompts
@@ -97,8 +107,9 @@ The current API is based on a small task lifecycle:
 
 ## Core Concepts
 
-1. Tenancy: use `X-Project-Id` to isolate tasks between projects
-2. Roles: tasks are assigned to roles such as `coder`
+1. Tenancy: use `X-Project-Id` to isolate task ownership and local queues between projects
+2. Roles: tasks are assigned to local roles such as `coder`, or opt-in global roles such as
+   `g:shared-lib:maintainer`
 3. Lifecycle: create a task, optionally wait for it, let a worker pick it up, then solve it
 
 ## Build & Run

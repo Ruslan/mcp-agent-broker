@@ -77,9 +77,11 @@ func (h *PollHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]any{"task": nil, "status": status})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"task": map[string]any{"task_id": task.ID, "title": task.Title, "task_md": task.MD},
-		})
+		taskPayload := map[string]any{"task_id": task.ID, "title": task.Title, "task_md": task.MD}
+		if workToken := h.broker.TaskWorkToken(task); workToken != "" {
+			taskPayload["work_token"] = workToken
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"task": taskPayload})
 
 	case PollScopeTask:
 		// Dispatcher: report the task's status; include result_md once solved.

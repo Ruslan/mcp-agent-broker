@@ -65,6 +65,8 @@ Notes:
   - Show current state (`Idle`, waiting, or active task).
 - `/cbump`
   - Re-send full prompt for current active task.
+- `/cprogress <message>`
+  - Report progress for the current active task.
 
 Examples:
 - `/c1`
@@ -92,7 +94,8 @@ Examples:
 </solution>
 ```
 
-6. Extension parses block and submits `solve_task`.
+6. Extension parses block and submits `solve_task`. For a global `g:<key>:<queue>` role it preserves
+   the returned opaque `work_token` and sends it with progress and solve calls.
 7. If continuous mode is active (started via `/c1` or `/r1` and not stopped), it immediately resumes waiting for next task.
 
 ## Important constraints
@@ -100,7 +103,13 @@ Examples:
 - Only one active task is handled at a time.
 - New tasks are not pulled while `activeTask` is unsolved.
 - Resume mode picks the first `picked` task for the requested role. It assumes a single worker per role/project or broker-side ownership; if multiple workers share the same role, configure distinct roles.
+- A previously picked **global** task cannot currently be resumed after the Pi extension process
+  restarts: its `work_token` is intentionally absent from `list_tasks` and `get_task`, and the
+  extension does not persist capability material locally. The owner/admin must requeue that task so
+  the global worker can pick it again and receive a capability. This limitation avoids widening
+  project visibility or exposing worker authority through discovery APIs.
 - `task_id` can be any non-empty quoted value (except quote/newline).
+- Global queue keys are namespace identifiers, not secrets or access-control credentials.
 
 ## Reload
 

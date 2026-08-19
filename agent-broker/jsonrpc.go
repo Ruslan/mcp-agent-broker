@@ -134,6 +134,7 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var toolName string
 	var toolStartedAt time.Time
 	var requeueOnWriteFailure string
+	var requeueOwnerProject string
 
 	switch req.Method {
 	case "initialize":
@@ -274,8 +275,9 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"inputSchema": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"task_id":   map[string]any{"type": "string"},
-						"result_md": map[string]any{"type": "string"},
+						"task_id":    map[string]any{"type": "string"},
+						"result_md":  map[string]any{"type": "string"},
+						"work_token": map[string]any{"type": "string", "description": "Opaque capability returned with a global task"},
 					},
 					"required": []string{"task_id", "result_md"},
 				},
@@ -286,8 +288,9 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"inputSchema": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"task_id": map[string]any{"type": "string"},
-						"message": map[string]any{"type": "string", "description": "Short human-readable status update (max 500 chars)"},
+						"task_id":    map[string]any{"type": "string"},
+						"message":    map[string]any{"type": "string", "description": "Short human-readable status update (max 500 chars)"},
+						"work_token": map[string]any{"type": "string", "description": "Opaque capability returned with a global task"},
 					},
 					"required": []string{"task_id", "message"},
 				},
@@ -320,6 +323,12 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				if params.Name == "listen_role" {
 					requeueOnWriteFailure = listenRoleTaskID(res)
+					requeueOwnerProject = projectID
+					if token := listenRoleWorkToken(res); token != "" && requeueOnWriteFailure != "" {
+						if owner, resolveErr := h.broker.ResolveWorkerProject(projectID, requeueOnWriteFailure, token); resolveErr == nil {
+							requeueOwnerProject = owner
+						}
+					}
 				}
 			}
 		}
@@ -336,8 +345,8 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.sendResult(w, req.ID, result); err != nil {
 		if requeueOnWriteFailure != "" {
-			if requeueErr := h.broker.RequeuePickedTask(projectID, requeueOnWriteFailure, "listen_role.response_write_failed"); requeueErr != nil {
-				log.Printf("failed to requeue task after response write failure: project=%s task=%s err=%v", projectID, requeueOnWriteFailure, requeueErr)
+			if requeueErr := h.broker.RequeuePickedTask(requeueOwnerProject, requeueOnWriteFailure, "listen_role.response_write_failed"); requeueErr != nil {
+				log.Printf("failed to requeue task after response write failure: project=%s task=%s err=%v", requeueOwnerProject, requeueOnWriteFailure, requeueErr)
 			}
 		}
 		if toolName != "" {
@@ -363,6 +372,19 @@ func listenRoleTaskID(res any) string {
 	}
 	taskID, _ := task["task_id"].(string)
 	return taskID
+}
+
+func listenRoleWorkToken(res any) string {
+	m, ok := res.(map[string]any)
+	if !ok {
+		return ""
+	}
+	task, ok := m["task"].(map[string]any)
+	if !ok || task == nil {
+		return ""
+	}
+	token, _ := task["work_token"].(string)
+	return token
 }
 
 // mintPollURL mints a scoped poll token for (projectID, kind, value) and returns
@@ -485,6 +507,9 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, pollBase
 				"task_md": task.MD,
 			},
 		}
+		if workToken := h.broker.TaskWorkToken(task); workToken != "" {
+			resp["task"].(map[string]any)["work_token"] = workToken
+		}
 		if pollURL != "" {
 			resp["poll_url"] = pollURL
 		}
@@ -559,21 +584,30 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, pollBase
 
 	case "solve_task":
 		var p struct {
-			TaskID   string `json:"task_id"`
-			ResultMD string `json:"result_md"`
+			TaskID    string `json:"task_id"`
+			ResultMD  string `json:"result_md"`
+			WorkToken string `json:"work_token"`
 		}
 		if err := json.Unmarshal(args, &p); err != nil || p.TaskID == "" || p.ResultMD == "" {
 			return nil, fmt.Errorf("invalid arguments: task_id and result_md are required")
 		}
-		if err := h.broker.SolveTask(projectID, p.TaskID, p.ResultMD); err != nil {
+		ownerProject, err := h.broker.ResolveWorkerProject(projectID, p.TaskID, p.WorkToken)
+		if err != nil {
+			return nil, err
+		}
+		if err := h.broker.SolveTask(ownerProject, p.TaskID, p.ResultMD); err != nil {
+			if p.WorkToken != "" {
+				return nil, fmt.Errorf("solve_task failed for task_id %q", p.TaskID)
+			}
 			return nil, err
 		}
 		return map[string]bool{"ok": true}, nil
 
 	case "progress_task":
 		var p struct {
-			TaskID  string `json:"task_id"`
-			Message string `json:"message"`
+			TaskID    string `json:"task_id"`
+			Message   string `json:"message"`
+			WorkToken string `json:"work_token"`
 		}
 		if err := json.Unmarshal(args, &p); err != nil || p.TaskID == "" || p.Message == "" {
 			return nil, fmt.Errorf("invalid arguments: task_id and message are required")
@@ -581,7 +615,14 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, pollBase
 		if len(p.Message) > 500 {
 			return nil, fmt.Errorf("message too long (max 500 chars)")
 		}
-		if err := h.broker.ReportProgress(projectID, p.TaskID, p.Message); err != nil {
+		ownerProject, err := h.broker.ResolveWorkerProject(projectID, p.TaskID, p.WorkToken)
+		if err != nil {
+			return nil, err
+		}
+		if err := h.broker.ReportProgress(ownerProject, p.TaskID, p.Message); err != nil {
+			if p.WorkToken != "" {
+				return nil, fmt.Errorf("progress_task failed for task_id %q", p.TaskID)
+			}
 			return nil, err
 		}
 		return map[string]bool{"ok": true}, nil

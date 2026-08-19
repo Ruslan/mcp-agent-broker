@@ -26,14 +26,15 @@
 # woken already OWNING it: do the work, solve_task, then RELAUNCH this script.
 #
 # Exit codes (the harness wakes the agent on exit):
-#   0   a task was picked — one JSON object on stdout: {"task_id","title","task_md"}
+#   0   a task was picked — one JSON object on stdout. Global tasks also carry
+#       an opaque "work_token" that MUST be sent to progress_task/solve_task.
 #   3   the broker was unreachable / returned garbage / errored too long
 #   4   BROKER_MAX_WAIT elapsed with still no task — relaunch to keep waiting
 #   5   the poll token EXPIRED — call listen_role again for a fresh poll_url, then relaunch
 #   64  usage error (no poll_url, or a non-integer numeric env var)
 #   69  a required command (curl or jq) is missing
 #
-# BROKER_SKILL_VERSION=5
+# BROKER_SKILL_VERSION=6
 set -u
 
 url="${1:-${BROKER_POLL_URL:-}}"

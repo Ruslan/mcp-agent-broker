@@ -18,6 +18,7 @@ header, no API key**. It's a cheap, disposable capability — hand it to a dumb 
 
 - `create_task(...)` → `{ task_id, status:"queued", poll_url }` — the poll_url tracks THAT task.
 - `listen_role(role, mode="poll")` → `{ task?, poll_url }` — the poll_url takes tasks for THAT role.
+  A task from a global `g:<key>:<queue>` role includes an opaque `work_token`.
 - `get_task(task_id)` → also returns a fresh `poll_url` (so a dispatcher can re-arm after expiry).
 
 ## Strict capability-URL policy
@@ -46,7 +47,13 @@ Three tiny `curl`+`jq` scripts, each taking a poll_url (as `$1` or `BROKER_POLL_
    (or pass the url as `$1`). Then **keep working / go idle**.
 3. The harness wakes you when the script exits 0 with one JSON line
    `{"task_id":...,"title":...,"task_md":...}` — you already **own** the task. Do the work,
-   `solve_task(task_id, result_md)`, then **relaunch** the script. No human in the loop.
+   For a local task call `solve_task(task_id, result_md)`. For a global task, preserve the exact
+   `work_token` from the JSON and call `progress_task(..., work_token)` and
+   `solve_task(task_id, result_md, work_token)`. Then **relaunch** the script. No human in the loop.
+
+Global role keys are routing namespace identifiers, not secrets and not queue ACLs. Broker-level
+authentication remains the security boundary. Never print or log `work_token` separately; pass it
+only back to the broker with progress/solve calls.
 
 ## Contract — dispatcher (wake-on-exit)
 1. `create_task(role="coder", title=..., task_md=...)` → `{ task_id, poll_url }`.

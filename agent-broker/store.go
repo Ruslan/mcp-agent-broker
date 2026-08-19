@@ -67,6 +67,13 @@ type Store interface {
 	// unknown one (found=false → 404, as if the URL never existed).
 	RenewPollToken(token string, ttl, maxLifetime time.Duration) (scope *PollTokenScope, found bool, err error)
 
+	// Work tokens are task-scoped worker capabilities. Unlike role poll tokens,
+	// they authorize only progress/solve for one task and carry the owning
+	// project so a worker in another project never needs tenant-wide access.
+	InsertWorkToken(token, projectID, taskID string, createdAt, expiresAt time.Time) error
+	GetActiveWorkToken(projectID, taskID string) (*WorkTokenScope, error)
+	GetWorkToken(token string) (*WorkTokenScope, error)
+
 	Close() error
 }
 
@@ -79,6 +86,15 @@ type PollTokenScope struct {
 	ProjectID string
 	Kind      string
 	Value     string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
+// WorkTokenScope binds an opaque worker capability to exactly one task owner.
+type WorkTokenScope struct {
+	Token     string
+	ProjectID string
+	TaskID    string
 	CreatedAt time.Time
 	ExpiresAt time.Time
 }
@@ -144,6 +160,14 @@ func sqliteMigrate(db *sql.DB) error {
 			expires_at  TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_poll_tokens_scope ON poll_tokens (project_id, scope_kind, scope_value)`,
+		`CREATE TABLE IF NOT EXISTS work_tokens (
+			token       TEXT PRIMARY KEY,
+			project_id  TEXT NOT NULL,
+			task_id     TEXT NOT NULL,
+			created_at  TEXT NOT NULL,
+			expires_at  TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_work_tokens_task ON work_tokens (project_id, task_id, expires_at)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -226,6 +250,12 @@ func (s *SQLiteStore) ClearResult(projectID, taskID string) error {
 }
 
 func (s *SQLiteStore) DeleteTask(projectID, taskID string) error {
+	if _, err := s.db.Exec(
+		`DELETE FROM work_tokens WHERE project_id = ? AND task_id = ?`,
+		projectID, taskID,
+	); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(
 		`DELETE FROM tasks WHERE project_id = ? AND task_id = ?`,
 		projectID, taskID,
@@ -526,6 +556,59 @@ func scanPollToken(row *sql.Row) (*PollTokenScope, error) {
 	if t, perr := time.Parse(time.RFC3339, expires); perr == nil {
 		scope.ExpiresAt = t
 	}
+	return &scope, nil
+}
+
+// InsertWorkToken persists a restart-safe task capability and opportunistically
+// removes capabilities past their fixed lifetime.
+func (s *SQLiteStore) InsertWorkToken(token, projectID, taskID string, createdAt, expiresAt time.Time) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := s.db.Exec(`DELETE FROM work_tokens WHERE expires_at <= ?`, now); err != nil {
+		return fmt.Errorf("failed to prune expired work tokens: %w", err)
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO work_tokens (token, project_id, task_id, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		token, projectID, taskID, createdAt.UTC().Format(time.RFC3339), expiresAt.UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert work token: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) GetActiveWorkToken(projectID, taskID string) (*WorkTokenScope, error) {
+	row := s.db.QueryRow(
+		`SELECT token, project_id, task_id, created_at, expires_at
+		 FROM work_tokens
+		 WHERE project_id = ? AND task_id = ? AND expires_at > ?
+		 ORDER BY expires_at DESC LIMIT 1`,
+		projectID, taskID, time.Now().UTC().Format(time.RFC3339),
+	)
+	return scanWorkToken(row)
+}
+
+func (s *SQLiteStore) GetWorkToken(token string) (*WorkTokenScope, error) {
+	row := s.db.QueryRow(
+		`SELECT token, project_id, task_id, created_at, expires_at
+		 FROM work_tokens WHERE token = ? AND expires_at > ?`,
+		token, time.Now().UTC().Format(time.RFC3339),
+	)
+	return scanWorkToken(row)
+}
+
+func scanWorkToken(row *sql.Row) (*WorkTokenScope, error) {
+	var scope WorkTokenScope
+	var created, expires string
+	err := row.Scan(&scope.Token, &scope.ProjectID, &scope.TaskID, &created, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan work token: %w", err)
+	}
+	scope.CreatedAt, _ = time.Parse(time.RFC3339, created)
+	scope.ExpiresAt, _ = time.Parse(time.RFC3339, expires)
 	return &scope, nil
 }
 

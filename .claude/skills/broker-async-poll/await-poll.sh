@@ -31,7 +31,7 @@
 #   64  usage error (no poll_url, or a non-integer numeric env var)
 #   69  a required command (curl or jq) is missing
 #
-# BROKER_SKILL_VERSION=5
+# BROKER_SKILL_VERSION=6
 set -u
 
 url="${1:-${BROKER_POLL_URL:-}}"

@@ -53,8 +53,32 @@ type Task struct {
 	Role      string
 	Title     string
 	MD        string
+	workToken string
 	done      chan string // buffered size 1
 	progress  chan string // buffered size 32, closed by SolveTask
+}
+
+// queueAddress keeps routing separate from task ownership. Local addresses are
+// scoped to a project; global addresses deliberately ignore the caller project.
+type queueAddress struct {
+	ProjectID string
+	Role      string
+	Global    bool
+}
+
+func addressFor(projectID, role string) queueAddress {
+	if isGlobalRole(role) {
+		return queueAddress{Role: role, Global: true}
+	}
+	return queueAddress{ProjectID: projectID, Role: role}
+}
+
+func isGlobalRole(role string) bool {
+	if !strings.HasPrefix(role, "g:") {
+		return false
+	}
+	parts := strings.SplitN(role, ":", 3)
+	return len(parts) == 3 && parts[1] != "" && parts[2] != ""
 }
 
 type listenerEntry struct {
@@ -67,9 +91,9 @@ type listenerEntry struct {
 // Broker manages the coordination between task creators and role listeners.
 type Broker struct {
 	mu         sync.Mutex
-	listeners  map[string]map[string]*listenerEntry // projectID -> role -> listener
-	tasks      map[string]map[string]*Task          // projectID -> taskID -> *Task
-	asyncQueue map[string]map[string][]*Task        // projectID -> role -> []*Task
+	listeners  map[queueAddress]*listenerEntry // routing address -> listener
+	tasks      map[string]map[string]*Task     // projectID -> taskID -> *Task
+	asyncQueue map[queueAddress][]*Task        // routing address -> []*Task
 	store      Store
 	promptsDir string
 
@@ -115,9 +139,9 @@ func NewBroker(store Store, promptsDir string, enableSync, enableAsync bool) (*B
 	}
 
 	b := &Broker{
-		listeners:   make(map[string]map[string]*listenerEntry),
+		listeners:   make(map[queueAddress]*listenerEntry),
 		tasks:       make(map[string]map[string]*Task),
-		asyncQueue:  make(map[string]map[string][]*Task),
+		asyncQueue:  make(map[queueAddress][]*Task),
 		store:       store,
 		promptsDir:  promptsDir,
 		EnableSync:  enableSync,
@@ -132,12 +156,21 @@ func NewBroker(store Store, promptsDir string, enableSync, enableAsync bool) (*B
 		return nil, fmt.Errorf("failed to restore active tasks: %w", err)
 	}
 	for _, r := range activeTasks {
+		workToken := ""
+		if isGlobalRole(r.Role) {
+			scope, tokenErr := b.MintWorkToken(r.ProjectID, r.TaskID)
+			if tokenErr != nil {
+				return nil, fmt.Errorf("failed to restore work capability: %w", tokenErr)
+			}
+			workToken = scope.Token
+		}
 		task := &Task{
 			ID:        r.TaskID,
 			ProjectID: r.ProjectID,
 			Role:      r.Role,
 			Title:     r.Title,
 			MD:        r.TaskMD,
+			workToken: workToken,
 			done:      make(chan string, 1),
 			progress:  make(chan string, 32),
 		}
@@ -146,10 +179,8 @@ func NewBroker(store Store, promptsDir string, enableSync, enableAsync bool) (*B
 		}
 		b.tasks[r.ProjectID][r.TaskID] = task
 		if r.Status == StatusQueued {
-			if b.asyncQueue[r.ProjectID] == nil {
-				b.asyncQueue[r.ProjectID] = make(map[string][]*Task)
-			}
-			b.asyncQueue[r.ProjectID][r.Role] = append(b.asyncQueue[r.ProjectID][r.Role], task)
+			addr := addressFor(r.ProjectID, r.Role)
+			b.asyncQueue[addr] = append(b.asyncQueue[addr], task)
 		}
 	}
 	if len(activeTasks) > 0 {
@@ -198,6 +229,12 @@ const (
 	pollTokenReuseFloor = 5 * time.Minute
 	PollScopeRole       = "role"
 	PollScopeTask       = "task"
+	// Work capabilities use a fixed lifetime: long enough for multi-day agent
+	// work, but bounded so a leaked capability does not remain valid forever.
+	workTokenLifetime = 7 * 24 * time.Hour
+	// A queued task should not be delivered with a capability near the end of
+	// that lifetime. Reuse only when almost the full working window remains.
+	workTokenReuseFloor = 6 * 24 * time.Hour
 )
 
 // MintPollToken returns a scoped poller token for (projectID, kind, value),
@@ -235,6 +272,72 @@ func (b *Broker) RenewPollToken(token string) (*PollTokenScope, bool, error) {
 	return b.store.RenewPollToken(token, pollTokenTTL, pollTokenMaxLifetime)
 }
 
+// MintWorkToken returns a restart-safe capability for one global task. Active
+// tokens are reused so response retries and administrative requeues preserve
+// the capability carried by a worker integration.
+func (b *Broker) MintWorkToken(projectID, taskID string) (*WorkTokenScope, error) {
+	if existing, err := b.store.GetActiveWorkToken(projectID, taskID); err != nil {
+		return nil, err
+	} else if existing != nil && time.Until(existing.ExpiresAt) >= workTokenReuseFloor {
+		return existing, nil
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, fmt.Errorf("failed to generate work token: %w", err)
+	}
+	now := time.Now().UTC()
+	scope := &WorkTokenScope{
+		Token: hex.EncodeToString(raw), ProjectID: projectID, TaskID: taskID,
+		CreatedAt: now, ExpiresAt: now.Add(workTokenLifetime),
+	}
+	if err := b.store.InsertWorkToken(scope.Token, scope.ProjectID, scope.TaskID, scope.CreatedAt, scope.ExpiresAt); err != nil {
+		return nil, err
+	}
+	return scope, nil
+}
+
+// ResolveWorkerProject applies the worker capability boundary. Omitting a token
+// retains local behavior. Supplying one must resolve to this exact task; all
+// invalid, expired, or mismatched capabilities intentionally share one error.
+func (b *Broker) ResolveWorkerProject(callerProjectID, taskID, workToken string) (string, error) {
+	if workToken == "" {
+		return callerProjectID, nil
+	}
+	scope, err := b.store.GetWorkToken(workToken)
+	if err != nil {
+		return "", fmt.Errorf("invalid work_token")
+	}
+	if scope == nil || scope.TaskID != taskID {
+		return "", fmt.Errorf("invalid work_token")
+	}
+	return scope.ProjectID, nil
+}
+
+func (b *Broker) ensureTaskWorkToken(task *Task) error {
+	if !isGlobalRole(task.Role) {
+		task.workToken = ""
+		return nil
+	}
+	scope, err := b.MintWorkToken(task.ProjectID, task.ID)
+	if err != nil {
+		return err
+	}
+	task.workToken = scope.Token
+	return nil
+}
+
+// TaskWorkToken returns the capability to include in a worker delivery. Task
+// fields can be refreshed by admin/requeue paths, so callers must not read the
+// field directly after ListenRole releases the broker lock.
+func (b *Broker) TaskWorkToken(task *Task) string {
+	if task == nil {
+		return ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return task.workToken
+}
+
 func (b *Broker) resultDiagnostics(projectID, taskID string) (bool, int, error) {
 	result, err := b.store.GetResult(projectID, taskID)
 	if err != nil {
@@ -254,15 +357,13 @@ func (b *Broker) memoryDiagnostics(projectID, taskID string) (bool, string, int)
 
 	queuedRole := ""
 	queueOccurrences := 0
-	if projectQueue, ok := b.asyncQueue[projectID]; ok {
-		for role, queue := range projectQueue {
-			for _, task := range queue {
-				if task.ID == taskID {
-					if queuedRole == "" {
-						queuedRole = role
-					}
-					queueOccurrences++
+	for addr, queue := range b.asyncQueue {
+		for _, task := range queue {
+			if task.ProjectID == projectID && task.ID == taskID {
+				if queuedRole == "" {
+					queuedRole = addr.Role
 				}
+				queueOccurrences++
 			}
 		}
 	}
@@ -286,36 +387,29 @@ func (b *Broker) logPickAttempt(projectID string, task *Task, source string, que
 	log.Printf("task pick attempt: source=%s project=%s task=%s role=%s queue_len=%d db_status=%s result_present=%t result_len=%d", source, projectID, task.ID, task.Role, queueLen, meta.Status, resultPresent, resultLen)
 }
 
-func (b *Broker) deleteListenerLocked(projectID, role string, listener *listenerEntry) bool {
-	projectListeners, ok := b.listeners[projectID]
-	if !ok || projectListeners[role] != listener {
+func (b *Broker) deleteListenerLocked(addr queueAddress, listener *listenerEntry) bool {
+	if b.listeners[addr] != listener {
 		return false
 	}
-	delete(projectListeners, role)
-	if len(projectListeners) == 0 {
-		delete(b.listeners, projectID)
-	}
+	delete(b.listeners, addr)
 	return true
 }
 
-func (b *Broker) enqueueUniqueLocked(projectID, role string, task *Task) bool {
-	if b.asyncQueue[projectID] == nil {
-		b.asyncQueue[projectID] = make(map[string][]*Task)
-	}
-	for _, queued := range b.asyncQueue[projectID][role] {
-		if queued.ID == task.ID {
+func (b *Broker) enqueueUniqueLocked(addr queueAddress, task *Task) bool {
+	for _, queued := range b.asyncQueue[addr] {
+		if queued.ProjectID == task.ProjectID && queued.ID == task.ID {
 			return false
 		}
 	}
-	b.asyncQueue[projectID][role] = append(b.asyncQueue[projectID][role], task)
+	b.asyncQueue[addr] = append(b.asyncQueue[addr], task)
 	return true
 }
 
-func (b *Broker) requeueDeliveredTask(projectID string, listener *listenerEntry, source string) {
+func (b *Broker) requeueDeliveredTask(listener *listenerEntry, source string) {
 	select {
 	case task := <-listener.ch:
-		if err := b.RequeuePickedTask(projectID, task.ID, source); err != nil {
-			log.Printf("failed to requeue delivered task after listener exit: source=%s project=%s task=%s err=%v", source, projectID, task.ID, err)
+		if err := b.RequeuePickedTask(task.ProjectID, task.ID, source); err != nil {
+			log.Printf("failed to requeue delivered task after listener exit: source=%s project=%s task=%s err=%v", source, task.ProjectID, task.ID, err)
 		}
 	default:
 	}
@@ -347,6 +441,16 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 		return "", fmt.Errorf("failed to generate unique task_id after 5 attempts: %w", err)
 	}
 
+	workToken := ""
+	if isGlobalRole(role) {
+		scope, tokenErr := b.MintWorkToken(projectID, taskID)
+		if tokenErr != nil {
+			_ = b.store.DeleteTask(projectID, taskID)
+			return "", fmt.Errorf("failed to create work capability: %w", tokenErr)
+		}
+		workToken = scope.Token
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -356,6 +460,7 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 		Role:      role,
 		Title:     title,
 		MD:        taskMD,
+		workToken: workToken,
 		done:      make(chan string, 1),
 		progress:  make(chan string, 32),
 	}
@@ -364,58 +469,57 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 	}
 	b.tasks[projectID][taskID] = task
 
-	// If a listener is waiting, deliver directly
-	if projectListeners, ok := b.listeners[projectID]; ok {
-		if listener, hasListener := projectListeners[role]; hasListener {
-			if listener.ctx != nil && listener.ctx.Err() != nil {
-				listenerAge := time.Since(listener.startedAt).Round(time.Millisecond)
-				b.deleteListenerLocked(projectID, role, listener)
-				log.Printf("listen_role wait stale listener skipped: project=%s role=%s age=%s err=%v", projectID, role, listenerAge, listener.ctx.Err())
-			} else {
-				listenerAge := time.Since(listener.startedAt).Round(time.Millisecond)
-				b.logPickAttempt(projectID, task, "create_task.wait_listener", 0)
-				if err := b.store.UpdateStatus(projectID, taskID, StatusPicked); err != nil {
-					delete(b.tasks[projectID], taskID)
-					b.store.DeleteTask(projectID, taskID)
-					return "", fmt.Errorf("failed to update status to picked: %w", err)
+	addr := addressFor(projectID, role)
+	// If a listener is waiting, deliver directly.
+	if listener, hasListener := b.listeners[addr]; hasListener {
+		if listener.ctx != nil && listener.ctx.Err() != nil {
+			listenerAge := time.Since(listener.startedAt).Round(time.Millisecond)
+			b.deleteListenerLocked(addr, listener)
+			log.Printf("listen_role wait stale listener skipped: project=%s role=%s age=%s err=%v", projectID, role, listenerAge, listener.ctx.Err())
+		} else {
+			listenerAge := time.Since(listener.startedAt).Round(time.Millisecond)
+			b.logPickAttempt(projectID, task, "create_task.wait_listener", 0)
+			if err := b.store.UpdateStatus(projectID, taskID, StatusPicked); err != nil {
+				delete(b.tasks[projectID], taskID)
+				b.store.DeleteTask(projectID, taskID)
+				return "", fmt.Errorf("failed to update status to picked: %w", err)
+			}
+			log.Printf("task status transition: source=create_task.wait_listener project=%s task=%s role=%s to=%s listener_age=%s listener_timeout_ms=%d", projectID, taskID, role, StatusPicked, listenerAge, listener.timeoutMs)
+
+			// Wait-mode listeners are one-shot. Remove the listener before
+			// delivering so subsequent tasks are queued for the next listen call.
+			b.deleteListenerLocked(addr, listener)
+
+			select {
+			case <-listener.ctx.Done():
+				if err := b.store.UpdateStatus(projectID, taskID, StatusQueued); err != nil {
+					log.Printf("failed to rollback status for canceled listener task %s: %v", taskID, err)
+				} else {
+					resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
+					log.Printf("task status transition: source=create_task.wait_listener_canceled project=%s task=%s role=%s to=%s result_present=%t result_len=%d result_read_error=%v", projectID, taskID, role, StatusQueued, resultPresent, resultLen, resultErr)
 				}
-				log.Printf("task status transition: source=create_task.wait_listener project=%s task=%s role=%s to=%s listener_age=%s listener_timeout_ms=%d", projectID, taskID, role, StatusPicked, listenerAge, listener.timeoutMs)
-
-				// Wait-mode listeners are one-shot. Remove the listener before
-				// delivering so subsequent tasks are queued for the next listen call.
-				b.deleteListenerLocked(projectID, role, listener)
-
-				select {
-				case <-listener.ctx.Done():
-					if err := b.store.UpdateStatus(projectID, taskID, StatusQueued); err != nil {
-						log.Printf("failed to rollback status for canceled listener task %s: %v", taskID, err)
-					} else {
-						resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
-						log.Printf("task status transition: source=create_task.wait_listener_canceled project=%s task=%s role=%s to=%s result_present=%t result_len=%d result_read_error=%v", projectID, taskID, role, StatusQueued, resultPresent, resultLen, resultErr)
-					}
-				case listener.ch <- task:
-					log.Printf("listen_role wait delivered: project=%s role=%s task=%s listener_age=%s", projectID, role, taskID, listenerAge)
-					b.publishAdminEvent(statusEvent{
-						ProjectID: projectID,
-						TaskID:    taskID,
-						Status:    StatusPicked,
-						UpdatedAt: time.Now().UTC(),
-					})
-					return taskID, nil
-				default:
-					// Listener was busy/disappeared, rollback to queued
-					if err := b.store.UpdateStatus(projectID, taskID, StatusQueued); err != nil {
-						log.Printf("failed to rollback status for task %s: %v", taskID, err)
-					} else {
-						resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
-						log.Printf("task status transition: source=create_task.wait_listener_rollback project=%s task=%s role=%s to=%s result_present=%t result_len=%d result_read_error=%v", projectID, taskID, role, StatusQueued, resultPresent, resultLen, resultErr)
-					}
+			case listener.ch <- task:
+				log.Printf("listen_role wait delivered: project=%s role=%s task=%s listener_age=%s", projectID, role, taskID, listenerAge)
+				b.publishAdminEvent(statusEvent{
+					ProjectID: projectID,
+					TaskID:    taskID,
+					Status:    StatusPicked,
+					UpdatedAt: time.Now().UTC(),
+				})
+				return taskID, nil
+			default:
+				// Listener was busy/disappeared, rollback to queued
+				if err := b.store.UpdateStatus(projectID, taskID, StatusQueued); err != nil {
+					log.Printf("failed to rollback status for task %s: %v", taskID, err)
+				} else {
+					resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, taskID)
+					log.Printf("task status transition: source=create_task.wait_listener_rollback project=%s task=%s role=%s to=%s result_present=%t result_len=%d result_read_error=%v", projectID, taskID, role, StatusQueued, resultPresent, resultLen, resultErr)
 				}
 			}
 		}
 	}
 
-	b.enqueueUniqueLocked(projectID, role, task)
+	b.enqueueUniqueLocked(addr, task)
 
 	b.publishAdminEvent(statusEvent{
 		ProjectID: projectID,
@@ -553,31 +657,37 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 	}
 
 	b.mu.Lock()
+	addr := addressFor(projectID, role)
 	// Check for queued async work first
-	if projectQueue, ok := b.asyncQueue[projectID]; ok {
-		for queue := projectQueue[role]; len(queue) > 0; queue = projectQueue[role] {
+	if _, ok := b.asyncQueue[addr]; ok {
+		for queue := b.asyncQueue[addr]; len(queue) > 0; queue = b.asyncQueue[addr] {
 			task := queue[0]
-			projectQueue[role] = queue[1:]
+			b.asyncQueue[addr] = queue[1:]
 
-			meta, metaErr := b.store.GetStatus(projectID, task.ID)
-			resultPresent, resultLen, resultErr := b.resultDiagnostics(projectID, task.ID)
+			meta, metaErr := b.store.GetStatus(task.ProjectID, task.ID)
+			resultPresent, resultLen, resultErr := b.resultDiagnostics(task.ProjectID, task.ID)
 			if metaErr != nil || meta.Status != StatusQueued || resultPresent || resultErr != nil {
 				status := ""
 				if meta != nil {
 					status = string(meta.Status)
 				}
-				log.Printf("task pick skipped: source=listen_role.%s project=%s task=%s role=%s queue_len_before=%d db_status=%s status_read_error=%v result_present=%t result_len=%d result_read_error=%v", mode, projectID, task.ID, role, len(queue), status, metaErr, resultPresent, resultLen, resultErr)
+				log.Printf("task pick skipped: source=listen_role.%s project=%s task=%s role=%s queue_len_before=%d db_status=%s status_read_error=%v result_present=%t result_len=%d result_read_error=%v", mode, task.ProjectID, task.ID, role, len(queue), status, metaErr, resultPresent, resultLen, resultErr)
 				continue
 			}
 
-			b.logPickAttempt(projectID, task, "listen_role."+mode, len(queue))
-			if err := b.store.UpdateStatus(projectID, task.ID, StatusPicked); err != nil {
+			if err := b.ensureTaskWorkToken(task); err != nil {
+				b.asyncQueue[addr] = append([]*Task{task}, b.asyncQueue[addr]...)
+				b.mu.Unlock()
+				return nil, "", fmt.Errorf("failed to create work capability: %w", err)
+			}
+			b.logPickAttempt(task.ProjectID, task, "listen_role."+mode, len(queue))
+			if err := b.store.UpdateStatus(task.ProjectID, task.ID, StatusPicked); err != nil {
 				b.mu.Unlock()
 				return nil, "", fmt.Errorf("failed to update status to picked: %w", err)
 			}
-			log.Printf("task status transition: source=listen_role.%s project=%s task=%s role=%s to=%s queue_len_before=%d", mode, projectID, task.ID, role, StatusPicked, len(queue))
+			log.Printf("task status transition: source=listen_role.%s project=%s task=%s role=%s to=%s queue_len_before=%d", mode, task.ProjectID, task.ID, role, StatusPicked, len(queue))
 			b.publishAdminEvent(statusEvent{
-				ProjectID: projectID,
+				ProjectID: task.ProjectID,
 				TaskID:    task.ID,
 				Status:    StatusPicked,
 				UpdatedAt: time.Now().UTC(),
@@ -594,15 +704,14 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 	}
 
 	// Mode is wait
-	if projectListeners, ok := b.listeners[projectID]; ok {
-		if existing, exists := projectListeners[role]; exists {
-			age := time.Since(existing.startedAt).Round(time.Millisecond)
-			log.Printf("listen_role wait duplicate: project=%s role=%s existing_age=%s existing_timeout_ms=%d", projectID, role, age, existing.timeoutMs)
-			b.mu.Unlock()
-			return nil, "", fmt.Errorf("role %q already has a listener in project %q", role, projectID)
+	if existing, exists := b.listeners[addr]; exists {
+		age := time.Since(existing.startedAt).Round(time.Millisecond)
+		log.Printf("listen_role wait duplicate: project=%s role=%s existing_age=%s existing_timeout_ms=%d", projectID, role, age, existing.timeoutMs)
+		b.mu.Unlock()
+		if addr.Global {
+			return nil, "", fmt.Errorf("role %q already has a listener", role)
 		}
-	} else {
-		b.listeners[projectID] = make(map[string]*listenerEntry)
+		return nil, "", fmt.Errorf("role %q already has a listener in project %q", role, projectID)
 	}
 
 	listenerCtx := ctx
@@ -620,14 +729,14 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 		startedAt: time.Now().UTC(),
 		timeoutMs: timeoutMs,
 	}
-	b.listeners[projectID][role] = listener
+	b.listeners[addr] = listener
 	log.Printf("listen_role wait registered: project=%s role=%s timeout_ms=%d", projectID, role, timeoutMs)
 	b.mu.Unlock()
 
 	exitReason := "unknown"
 	defer func() {
 		b.mu.Lock()
-		if b.deleteListenerLocked(projectID, role, listener) {
+		if b.deleteListenerLocked(addr, listener) {
 			log.Printf("listen_role wait cleanup: project=%s role=%s reason=%s age=%s timeout_ms=%d", projectID, role, exitReason, time.Since(listener.startedAt).Round(time.Millisecond), timeoutMs)
 		}
 		b.mu.Unlock()
@@ -645,18 +754,18 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 		return task, "picked", nil
 	case <-ctx.Done():
 		exitReason = "context_canceled"
-		b.requeueDeliveredTask(projectID, listener, "listen_role.context_canceled_after_delivery")
+		b.requeueDeliveredTask(listener, "listen_role.context_canceled_after_delivery")
 		log.Printf("listen_role wait context canceled: project=%s role=%s age=%s err=%v", projectID, role, time.Since(listener.startedAt).Round(time.Millisecond), ctx.Err())
 		return nil, "", ctx.Err()
 	case <-timeoutCh:
 		if ctx.Err() != nil {
 			exitReason = "context_canceled"
-			b.requeueDeliveredTask(projectID, listener, "listen_role.context_canceled_after_delivery")
+			b.requeueDeliveredTask(listener, "listen_role.context_canceled_after_delivery")
 			log.Printf("listen_role wait context canceled: project=%s role=%s age=%s err=%v", projectID, role, time.Since(listener.startedAt).Round(time.Millisecond), ctx.Err())
 			return nil, "", ctx.Err()
 		}
 		exitReason = "timeout"
-		b.requeueDeliveredTask(projectID, listener, "listen_role.timeout_after_delivery")
+		b.requeueDeliveredTask(listener, "listen_role.timeout_after_delivery")
 		log.Printf("listen_role wait timeout: project=%s role=%s age=%s timeout_ms=%d", projectID, role, time.Since(listener.startedAt).Round(time.Millisecond), timeoutMs)
 		return nil, "timeout", nil
 	}
@@ -837,7 +946,11 @@ func (b *Broker) RequeuePickedTask(projectID, taskID, source string) error {
 	} else if task.MD == "" {
 		task.MD = md
 	}
-	enqueued := b.enqueueUniqueLocked(projectID, meta.Role, task)
+	if err := b.ensureTaskWorkToken(task); err != nil {
+		b.mu.Unlock()
+		return fmt.Errorf("failed to refresh work capability: %w", err)
+	}
+	enqueued := b.enqueueUniqueLocked(addressFor(projectID, meta.Role), task)
 	b.mu.Unlock()
 
 	b.publishAdminEvent(statusEvent{
@@ -911,7 +1024,11 @@ func (b *Broker) AdminUpdateStatus(projectID, taskID, newStatus string) error {
 			task.MD = md
 		}
 
-		b.enqueueUniqueLocked(projectID, meta.Role, task)
+		if err := b.ensureTaskWorkToken(task); err != nil {
+			b.mu.Unlock()
+			return fmt.Errorf("failed to refresh work capability: %w", err)
+		}
+		b.enqueueUniqueLocked(addressFor(projectID, meta.Role), task)
 		b.mu.Unlock()
 	} else {
 		b.cleanupInMemory(projectID, taskID, "")

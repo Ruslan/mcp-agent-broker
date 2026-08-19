@@ -5,6 +5,7 @@ export type BrokerTask = {
   role: string;
   taskId: string;
   taskMd: string;
+  workToken?: string;
 };
 
 type BrokerConfig = {
@@ -90,8 +91,31 @@ export class BrokerClient {
     return this.callTool("listen_role", { role, mode }, signal);
   }
 
-  async solveTask(taskId: string, resultMd: string, signal?: AbortSignal) {
-    return this.callTool("solve_task", { task_id: taskId, result_md: resultMd }, signal);
+  async solveTask(taskId: string, resultMd: string, signal?: AbortSignal): Promise<any>;
+  async solveTask(taskId: string, resultMd: string, workToken?: string, signal?: AbortSignal): Promise<any>;
+  async solveTask(
+    taskId: string,
+    resultMd: string,
+    workTokenOrSignal?: string | AbortSignal,
+    trailingSignal?: AbortSignal,
+  ) {
+    const workToken = typeof workTokenOrSignal === "string" ? workTokenOrSignal : undefined;
+    const signal = typeof workTokenOrSignal === "string"
+      ? trailingSignal
+      : (workTokenOrSignal ?? trailingSignal);
+    return this.callTool(
+      "solve_task",
+      { task_id: taskId, result_md: resultMd, ...(workToken ? { work_token: workToken } : {}) },
+      signal,
+    );
+  }
+
+  async progressTask(taskId: string, message: string, workToken?: string, signal?: AbortSignal) {
+    return this.callTool(
+      "progress_task",
+      { task_id: taskId, message, ...(workToken ? { work_token: workToken } : {}) },
+      signal,
+    );
   }
 
   async listPickedTasks(role: string, signal?: AbortSignal) {
@@ -169,5 +193,6 @@ export function extractTask(decoded: any): BrokerTask | null {
     role: decoded?.role ?? decoded?.task?.role ?? "coder",
     taskId,
     taskMd: decoded?.task_md ?? decoded?.task?.task_md ?? decoded?.task?.description ?? "",
+    workToken: decoded?.work_token ?? decoded?.task?.work_token,
   };
 }

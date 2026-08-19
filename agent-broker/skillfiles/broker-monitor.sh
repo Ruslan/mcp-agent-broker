@@ -28,7 +28,7 @@
 # poll_url), 64 usage, 69 missing curl/jq. On "solved" (task scope) it prints the
 # result and exits 0 — the task is terminal.
 #
-# BROKER_SKILL_VERSION=5
+# BROKER_SKILL_VERSION=6
 set -u
 
 url="${1:-${BROKER_POLL_URL:-}}"

@@ -13,7 +13,7 @@ import (
 // run `make sync-skillfiles`. TestBrokerSkillVersionMarkersMatchConstant
 // enforces that the markers equal this constant; skill-install advertises this
 // number so an agent can compare it against an already-installed skill.
-const BrokerSkillVersion = 5
+const BrokerSkillVersion = 6
 
 // The embedded sources below are the CANONICAL broker-async-poll skill files —
 // this is where a developer edits the scripts and SKILL.md. They live under

@@ -27,6 +27,7 @@ storage schema, or public HTTP surface changes significantly.
 ├── config/deploy.yml           # Kamal 2 deployment configuration
 ├── docs/dev/                   # Historical plans and forward-looking designs
 ├── docs/bugs/                  # One Markdown card per open defect
+├── docs/tasks/                 # One Markdown card per planned feature
 ├── data/                       # Runtime SQLite location for local/systemd use
 └── Makefile
 ```
@@ -35,9 +36,13 @@ storage schema, or public HTTP surface changes significantly.
 
 - **Process:** one Go binary serves MCP/JSON-RPC, the admin REST API, admin SSE,
   capability polling, the skill installer, health checks, and the embedded SPA.
-- **State:** task metadata, results, progress, and poll capabilities are persisted
-  in SQLite. Active tasks, per-role queues, blocking listeners, and SSE subscribers
-  also have in-memory representations.
+- **State:** task metadata, results, progress, poll capabilities, and global-task
+  worker capabilities are persisted in SQLite. Active tasks, queue-addressed
+  work lists, blocking listeners, and SSE subscribers also have in-memory
+  representations.
+- **Routing:** local queue addresses are `(project_id, role)`. Roles matching
+  `g:<key>:<queue>` use a broker-global address keyed by the complete role; task
+  ownership remains the creator's `project_id`.
 - **Recovery:** queued and picked tasks are loaded from SQLite at startup. Queued
   tasks return to their role queues; picked tasks stay addressable for a worker to
   solve or for an administrator to requeue.
@@ -113,6 +118,26 @@ Foreign-key enforcement is not currently enabled; see
 Poll tokens have an approximately 30-minute sliding TTL and a hard 24-hour
 lifetime. Active tokens are reused per scope while enough lifetime remains.
 
+### `work_tokens`
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `token` | TEXT | Primary key; 32 random bytes encoded as hex |
+| `project_id` | TEXT | Owning task project |
+| `task_id` | TEXT | Single task authorized for progress/solve |
+| `created_at` | TEXT | RFC3339 UTC creation time |
+| `expires_at` | TEXT | Fixed seven-day expiry |
+
+Work tokens are minted only for global tasks, persisted across restarts, and
+returned only to the worker that picks the task. Their fixed lifetime is seven
+days. At delivery, an existing token is reused only when at least six days
+remain; otherwise the broker mints a new token. Rotation does not revoke older
+tokens: a previously delivered token remains valid until its own expiry, which
+keeps picked-task restart recovery and admin requeue from acting like an
+implicit worker lease cancellation. Deleting the task revokes all of its work
+tokens. They are capability material accepted by `progress_task` and
+`solve_task`, but omitted from task metadata, admin responses, SSE, and logs.
+
 ## HTTP surface
 
 | Method | Path | Purpose | Broker authentication |
@@ -151,8 +176,8 @@ open capability and installer paths. See
 | `listen_role` | Always | Worker pickup; allowed modes depend on feature flags |
 | `list_tasks` | Always | Return up to 20 recent metadata records |
 | `get_task` | Always | Context-efficient task or result lookup |
-| `solve_task` | Always | Store the final result |
-| `progress_task` | Always | Append an intermediate progress message |
+| `solve_task` | Always | Store the final result; accepts global-task `work_token` |
+| `progress_task` | Always | Append progress; accepts global-task `work_token` |
 
 The server also exposes MCP `prompts/list` and `prompts/get`. The synthetic
 `skill-install` prompt returns the same installer body as `/skill/install`.
@@ -165,7 +190,10 @@ in the working directory is loaded first, while non-empty process environment
 values take precedence.
 
 At least one of sync or async mode must be enabled. `X-Project-Id` selects the
-tenant for MCP and health requests; blank values use `default`.
+tenant for MCP and health requests; blank values use `default`. Normal roles are
+local to that tenant. A `g:<key>:<queue>` role is shared by all clients connected
+to this broker, while `<key>` is only a namespace identifier—not a credential or
+queue ACL.
 
 ## Build and verification
 
