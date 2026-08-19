@@ -51,6 +51,12 @@ Three tiny `curl`+`jq` scripts, each taking a poll_url (as `$1` or `BROKER_POLL_
    `work_token` from the JSON and call `progress_task(..., work_token)` and
    `solve_task(task_id, result_md, work_token)`. Then **relaunch** the script. No human in the loop.
 
+If a global worker restarts or loses its in-memory token, reconnect with the same
+`X-Project-Id`, call `list_tasks(role=..., status="picked")`, then `get_task(task_id)`.
+The broker persists the worker-project assignment, so that project can reread,
+progress, and solve its assigned task without the token. This recovery grants no
+access to other tasks in the owner project.
+
 Global role keys are routing namespace identifiers, not secrets and not queue ACLs. Broker-level
 authentication remains the security boundary. Never print or log `work_token` separately; pass it
 only back to the broker with progress/solve calls.

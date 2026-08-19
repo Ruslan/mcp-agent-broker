@@ -77,7 +77,8 @@ Examples:
 ## Runtime behavior
 
 1. Command first checks for already picked tasks (`list_tasks --status picked`).
-   - `list_tasks` may return lightweight metadata only, so extension fetches full task text via `get_task` before publishing resumed picked tasks.
+   - The broker includes global tasks durably assigned to this extension's `X-Project-Id`.
+   - `list_tasks` may return lightweight metadata only, so the extension fetches full task text via `get_task` before publishing resumed picked tasks.
 2. If none is picked, command starts wait loop (`listen_role --mode wait`).
 3. If transport fails, it retries automatically.
 4. When one task arrives, extension posts:
@@ -95,7 +96,9 @@ Examples:
 ```
 
 6. Extension parses block and submits `solve_task`. For a global `g:<key>:<queue>` role it preserves
-   the returned opaque `work_token` and sends it with progress and solve calls.
+   the returned opaque `work_token` and sends it with progress and solve calls. If the extension
+   restarts and loses that in-memory token, the broker's persisted worker-project assignment still
+   authorizes recovery through `list_tasks` and `get_task`.
 7. If continuous mode is active (started via `/c1` or `/r1` and not stopped), it immediately resumes waiting for next task.
 
 ## Important constraints
@@ -103,11 +106,8 @@ Examples:
 - Only one active task is handled at a time.
 - New tasks are not pulled while `activeTask` is unsolved.
 - Resume mode picks the first `picked` task for the requested role. It assumes a single worker per role/project or broker-side ownership; if multiple workers share the same role, configure distinct roles.
-- A previously picked **global** task cannot currently be resumed after the Pi extension process
-  restarts: its `work_token` is intentionally absent from `list_tasks` and `get_task`, and the
-  extension does not persist capability material locally. The owner/admin must requeue that task so
-  the global worker can pick it again and receive a capability. This limitation avoids widening
-  project visibility or exposing worker authority through discovery APIs.
+- A previously picked global task can be resumed after an extension restart only from the same
+  configured `X-Project-Id` that picked it. Requeue clears that durable assignment.
 - `task_id` can be any non-empty quoted value (except quote/newline).
 - Global queue keys are namespace identifiers, not secrets or access-control credentials.
 

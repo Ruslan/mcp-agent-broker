@@ -38,6 +38,7 @@ const (
 type StatusMetadata struct {
 	TaskID          string     `json:"task_id"`
 	ProjectID       string     `json:"project_id"`
+	WorkerProjectID string     `json:"worker_project_id,omitempty"`
 	Role            string     `json:"role"`
 	Title           string     `json:"title"`
 	Status          TaskStatus `json:"status"`
@@ -82,10 +83,11 @@ func isGlobalRole(role string) bool {
 }
 
 type listenerEntry struct {
-	ch        chan *Task
-	ctx       context.Context
-	startedAt time.Time
-	timeoutMs int
+	ch              chan *Task
+	ctx             context.Context
+	workerProjectID string
+	startedAt       time.Time
+	timeoutMs       int
 }
 
 // Broker manages the coordination between task creators and role listeners.
@@ -301,6 +303,15 @@ func (b *Broker) MintWorkToken(projectID, taskID string) (*WorkTokenScope, error
 // invalid, expired, or mismatched capabilities intentionally share one error.
 func (b *Broker) ResolveWorkerProject(callerProjectID, taskID, workToken string) (string, error) {
 	if workToken == "" {
+		ownerProjectID, found, err := b.store.ResolveTaskOwner(callerProjectID, taskID)
+		if err != nil {
+			return "", err
+		}
+		if found {
+			return ownerProjectID, nil
+		}
+		// Preserve the legacy local error shape by allowing the operation to
+		// perform its normal lookup in the caller's project.
 		return callerProjectID, nil
 	}
 	scope, err := b.store.GetWorkToken(workToken)
@@ -479,10 +490,18 @@ func (b *Broker) CreateTask(projectID, role, title, taskMD string) (string, erro
 		} else {
 			listenerAge := time.Since(listener.startedAt).Round(time.Millisecond)
 			b.logPickAttempt(projectID, task, "create_task.wait_listener", 0)
-			if err := b.store.UpdateStatus(projectID, taskID, StatusPicked); err != nil {
+			workerProjectID := ""
+			if addr.Global {
+				workerProjectID = listener.workerProjectID
+			}
+			claimed, err := b.store.ClaimTask(projectID, taskID, workerProjectID)
+			if err != nil || !claimed {
 				delete(b.tasks[projectID], taskID)
 				b.store.DeleteTask(projectID, taskID)
-				return "", fmt.Errorf("failed to update status to picked: %w", err)
+				if err != nil {
+					return "", fmt.Errorf("failed to claim task: %w", err)
+				}
+				return "", fmt.Errorf("failed to claim newly created task")
 			}
 			log.Printf("task status transition: source=create_task.wait_listener project=%s task=%s role=%s to=%s listener_age=%s listener_timeout_ms=%d", projectID, taskID, role, StatusPicked, listenerAge, listener.timeoutMs)
 
@@ -681,9 +700,18 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 				return nil, "", fmt.Errorf("failed to create work capability: %w", err)
 			}
 			b.logPickAttempt(task.ProjectID, task, "listen_role."+mode, len(queue))
-			if err := b.store.UpdateStatus(task.ProjectID, task.ID, StatusPicked); err != nil {
+			workerProjectID := ""
+			if addr.Global {
+				workerProjectID = projectID
+			}
+			claimed, err := b.store.ClaimTask(task.ProjectID, task.ID, workerProjectID)
+			if err != nil {
 				b.mu.Unlock()
-				return nil, "", fmt.Errorf("failed to update status to picked: %w", err)
+				return nil, "", fmt.Errorf("failed to claim task: %w", err)
+			}
+			if !claimed {
+				log.Printf("task pick skipped: source=listen_role.%s project=%s task=%s role=%s reason=claim_lost", mode, task.ProjectID, task.ID, role)
+				continue
 			}
 			log.Printf("task status transition: source=listen_role.%s project=%s task=%s role=%s to=%s queue_len_before=%d", mode, task.ProjectID, task.ID, role, StatusPicked, len(queue))
 			b.publishAdminEvent(statusEvent{
@@ -724,10 +752,11 @@ func (b *Broker) ListenRole(ctx context.Context, projectID, role, mode string, t
 	}
 
 	listener := &listenerEntry{
-		ch:        make(chan *Task, 1),
-		ctx:       listenerCtx,
-		startedAt: time.Now().UTC(),
-		timeoutMs: timeoutMs,
+		ch:              make(chan *Task, 1),
+		ctx:             listenerCtx,
+		workerProjectID: projectID,
+		startedAt:       time.Now().UTC(),
+		timeoutMs:       timeoutMs,
 	}
 	b.listeners[addr] = listener
 	log.Printf("listen_role wait registered: project=%s role=%s timeout_ms=%d", projectID, role, timeoutMs)
@@ -876,6 +905,12 @@ func (b *Broker) GetTaskMD(projectID, taskID string) (string, error) {
 // ListTasks returns task metadata filtered by optional role and status.
 func (b *Broker) ListTasks(projectID, role, status string, limit, offset int) ([]StatusMetadata, error) {
 	return b.store.ListTasks(projectID, role, status, limit, offset)
+}
+
+// ListAccessibleTasks includes global tasks durably assigned to this worker
+// project while keeping owner-only ListTasks available to the admin surface.
+func (b *Broker) ListAccessibleTasks(projectID, role, status string, limit, offset int) ([]StatusMetadata, error) {
+	return b.store.ListAccessibleTasks(projectID, role, status, limit, offset)
 }
 
 // CountTasks returns the total number of tasks matching the filters.

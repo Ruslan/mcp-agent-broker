@@ -247,7 +247,7 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tools = append(tools,
 			map[string]any{
 				"name":        "list_tasks",
-				"description": "Returns up to 20 most recent lightweight task metadata records. Filters allowed.",
+				"description": "Returns up to 20 recent tasks owned by this project plus global tasks assigned to it. Active assigned tasks are listed first. Filters allowed.",
 				"inputSchema": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -258,13 +258,14 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			},
 			map[string]any{
 				"name":        "get_task",
-				"description": "Returns detailed content for one task. Defaults to most useful payload to save context.",
+				"description": "Returns detailed content for an owned task or a global task assigned to this worker project. A work_token can also authorize access.",
 				"inputSchema": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"task_id":           map[string]any{"type": "string"},
 						"include_task_md":   map[string]any{"type": "boolean"},
 						"include_result_md": map[string]any{"type": "boolean"},
+						"work_token":        map[string]any{"type": "string", "description": "Opaque capability returned with a global task"},
 					},
 					"required": []string{"task_id"},
 				},
@@ -522,7 +523,7 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, pollBase
 		}
 		json.Unmarshal(args, &p) // ignoring error as all fields are optional
 
-		tasks, err := h.broker.ListTasks(projectID, p.Role, p.Status, defaultListTasksLimit, 0)
+		tasks, err := h.broker.ListAccessibleTasks(projectID, p.Role, p.Status, defaultListTasksLimit, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -538,12 +539,17 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, pollBase
 			TaskID          string `json:"task_id"`
 			IncludeTaskMD   bool   `json:"include_task_md"`
 			IncludeResultMD bool   `json:"include_result_md"`
+			WorkToken       string `json:"work_token"`
 		}
 		if err := json.Unmarshal(args, &p); err != nil || p.TaskID == "" {
 			return nil, fmt.Errorf("invalid arguments: task_id is required")
 		}
 
-		meta, err := h.broker.GetTaskStatus(projectID, p.TaskID)
+		ownerProjectID, err := h.broker.ResolveWorkerProject(projectID, p.TaskID, p.WorkToken)
+		if err != nil {
+			return nil, err
+		}
+		meta, err := h.broker.GetTaskStatus(ownerProjectID, p.TaskID)
 		if err != nil {
 			return nil, err
 		}
@@ -557,17 +563,17 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, pollBase
 		needsResultMD := p.IncludeResultMD || (meta.Status == StatusSolved && !p.IncludeTaskMD && !p.IncludeResultMD)
 
 		if needsTaskMD {
-			md, err := h.broker.GetTaskMD(projectID, p.TaskID)
+			md, err := h.broker.GetTaskMD(ownerProjectID, p.TaskID)
 			if err == nil {
 				resp["task_md"] = md
 			}
 		}
 
 		if needsResultMD && meta.Status == StatusSolved {
-			res, err := h.broker.GetTaskResult(projectID, p.TaskID)
+			res, err := h.broker.GetTaskResult(ownerProjectID, p.TaskID)
 			if err == nil {
 				resp["result_md"] = res
-				_, _ = h.broker.IncrementResultViewCount(projectID, p.TaskID)
+				_, _ = h.broker.IncrementResultViewCount(ownerProjectID, p.TaskID)
 			}
 		}
 
@@ -575,7 +581,7 @@ func (h *JSONRPCHandler) handleToolCall(ctx context.Context, projectID, pollBase
 		// dispatcher whose poller token expired can re-arm without re-creating the
 		// task — the "get the task again → new poll_url" path.
 		if meta.Status != StatusSolved {
-			if url := h.mintPollURL(projectID, pollBase, PollScopeTask, p.TaskID); url != "" {
+			if url := h.mintPollURL(ownerProjectID, pollBase, PollScopeTask, p.TaskID); url != "" {
 				resp["poll_url"] = url
 			}
 		}

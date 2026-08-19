@@ -64,13 +64,15 @@ Pi does not currently support MCP directly, but this repository includes an expe
 For multi-project usage, send `X-Project-Id` on requests so task queues stay isolated per project.
 When several projects use the same broker and intentionally share a worker queue, address it as
 `g:<key>:<queue>` (for example `g:shared-lib:maintainer`). The complete role is routed globally while
-the task remains owned and visible only under its creator's project. A global worker receives an
-opaque `work_token` with the task and must return it in `progress_task` and `solve_task`; local roles
+the task remains owned under its creator's project. When a worker picks a global task, the broker
+durably records that worker's `X-Project-Id`. The same worker project can then rediscover it through
+`list_tasks`, reread it with `get_task`, and call `progress_task` or `solve_task` after a client
+restart. Delivery also includes an opaque `work_token` as a task-scoped bearer fallback. Local roles
 remain token-free and project-local. `<key>` is a namespace label, not a secret or an ACL—broker
 authentication is still the security boundary. Global queues do not span separate broker instances.
-An admin requeue does not revoke an already issued work token; it remains valid until its fixed
-expiry (unless the task is deleted). Requeue is therefore retry/routing control, not a worker lease
-revocation mechanism.
+An admin requeue clears the worker-project assignment but does not revoke an already issued work
+token; that token remains valid until its fixed expiry (unless the task is deleted). Requeue is
+therefore routing reassignment, not capability revocation.
 
 The current API is based on a small task lifecycle:
 

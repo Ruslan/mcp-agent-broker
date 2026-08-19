@@ -15,12 +15,13 @@ var ErrTaskExists = errors.New("task already exists")
 
 // TaskRecord is a full task row returned by LoadActiveTasks (used for startup recovery).
 type TaskRecord struct {
-	ProjectID string
-	TaskID    string
-	Role      string
-	Title     string
-	TaskMD    string
-	Status    TaskStatus
+	ProjectID       string
+	TaskID          string
+	Role            string
+	Title           string
+	TaskMD          string
+	Status          TaskStatus
+	WorkerProjectID string
 }
 
 // Store abstracts all persistence operations. Implementations may use SQLite,
@@ -33,6 +34,9 @@ type Store interface {
 	UpdateStatus(projectID, taskID string, status TaskStatus) error
 	// UpdateStatusIfCurrent changes status only if the task is still in the expected status.
 	UpdateStatusIfCurrent(projectID, taskID string, current, next TaskStatus) (bool, error)
+	// ClaimTask atomically moves a queued task to picked and records the worker
+	// project for global queues. An empty worker project keeps local behavior.
+	ClaimTask(projectID, taskID, workerProjectID string) (bool, error)
 	// SaveResult atomically stores the result and sets status=solved.
 	SaveResult(projectID, taskID, resultMD string) error
 	// ClearResult clears the result_md field (used when admin resets task to queued).
@@ -49,6 +53,8 @@ type Store interface {
 	GetTaskMD(projectID, taskID string) (string, error)
 	GetResult(projectID, taskID string) (string, error)
 	ListTasks(projectID, role, status string, limit, offset int) ([]StatusMetadata, error)
+	ListAccessibleTasks(projectID, role, status string, limit, offset int) ([]StatusMetadata, error)
+	ResolveTaskOwner(projectID, taskID string) (ownerProjectID string, found bool, err error)
 	CountTasks(projectID, role, status string) (int, error)
 	ListProjects() ([]string, error)
 	// LoadActiveTasks returns all queued and picked tasks for memory restoration on startup.
@@ -68,7 +74,7 @@ type Store interface {
 	RenewPollToken(token string, ttl, maxLifetime time.Duration) (scope *PollTokenScope, found bool, err error)
 
 	// Work tokens are task-scoped worker capabilities. Unlike role poll tokens,
-	// they authorize only progress/solve for one task and carry the owning
+	// they authorize only read/progress/solve for one task and carry the owning
 	// project so a worker in another project never needs tenant-wide access.
 	InsertWorkToken(token, projectID, taskID string, createdAt, expiresAt time.Time) error
 	GetActiveWorkToken(projectID, taskID string) (*WorkTokenScope, error)
@@ -137,10 +143,13 @@ func sqliteMigrate(db *sql.DB) error {
 			result_md  TEXT,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
+			worker_project_id TEXT,
 			PRIMARY KEY (project_id, task_id)
 		)`,
+		`ALTER TABLE tasks ADD COLUMN worker_project_id TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_project_role   ON tasks (project_id, role)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks (project_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_tasks_worker_status ON tasks (worker_project_id, status)`,
 		`CREATE TABLE IF NOT EXISTS task_progress (
 			project_id TEXT NOT NULL,
 			task_id    TEXT NOT NULL,
@@ -199,8 +208,11 @@ func (s *SQLiteStore) InsertTask(projectID, taskID, role, title, taskMD string) 
 func (s *SQLiteStore) UpdateStatus(projectID, taskID string, status TaskStatus) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := s.db.Exec(
-		`UPDATE tasks SET status = ?, updated_at = ? WHERE project_id = ? AND task_id = ?`,
-		string(status), now, projectID, taskID,
+		`UPDATE tasks
+		 SET status = ?, updated_at = ?,
+		     worker_project_id = CASE WHEN ? = 'queued' THEN NULL ELSE worker_project_id END
+		 WHERE project_id = ? AND task_id = ?`,
+		string(status), now, string(status), projectID, taskID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update status: %w", err)
@@ -215,11 +227,29 @@ func (s *SQLiteStore) UpdateStatus(projectID, taskID string, status TaskStatus) 
 func (s *SQLiteStore) UpdateStatusIfCurrent(projectID, taskID string, current, next TaskStatus) (bool, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := s.db.Exec(
-		`UPDATE tasks SET status = ?, updated_at = ? WHERE project_id = ? AND task_id = ? AND status = ?`,
-		string(next), now, projectID, taskID, string(current),
+		`UPDATE tasks
+		 SET status = ?, updated_at = ?,
+		     worker_project_id = CASE WHEN ? = 'queued' THEN NULL ELSE worker_project_id END
+		 WHERE project_id = ? AND task_id = ? AND status = ?`,
+		string(next), now, string(next), projectID, taskID, string(current),
 	)
 	if err != nil {
 		return false, fmt.Errorf("failed to update status: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *SQLiteStore) ClaimTask(projectID, taskID, workerProjectID string) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.db.Exec(
+		`UPDATE tasks
+		 SET status = 'picked', updated_at = ?, worker_project_id = NULLIF(?, '')
+		 WHERE project_id = ? AND task_id = ? AND status = 'queued'`,
+		now, workerProjectID, projectID, taskID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("failed to claim task: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
@@ -315,13 +345,14 @@ func (s *SQLiteStore) IncrementResultViewCount(projectID, taskID string) (int, e
 
 func (s *SQLiteStore) GetStatus(projectID, taskID string) (*StatusMetadata, error) {
 	row := s.db.QueryRow(
-		`SELECT project_id, task_id, role, title, status, created_at, updated_at, result_view_count
+		`SELECT project_id, task_id, role, title, status, created_at, updated_at,
+		        result_view_count, COALESCE(worker_project_id, '')
 		 FROM tasks WHERE project_id = ? AND task_id = ?`,
 		projectID, taskID,
 	)
 	var m StatusMetadata
 	var createdAt, updatedAt string
-	err := row.Scan(&m.ProjectID, &m.TaskID, &m.Role, &m.Title, &m.Status, &createdAt, &updatedAt, &m.ResultViewCount)
+	err := row.Scan(&m.ProjectID, &m.TaskID, &m.Role, &m.Title, &m.Status, &createdAt, &updatedAt, &m.ResultViewCount, &m.WorkerProjectID)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("task %q not found in project %q", taskID, projectID)
 	}
@@ -367,7 +398,8 @@ func (s *SQLiteStore) GetResult(projectID, taskID string) (string, error) {
 }
 
 func (s *SQLiteStore) ListTasks(projectID, role, status string, limit, offset int) ([]StatusMetadata, error) {
-	query := `SELECT project_id, task_id, role, title, status, created_at, updated_at, result_view_count
+	query := `SELECT project_id, task_id, role, title, status, created_at, updated_at,
+	                 result_view_count, COALESCE(worker_project_id, '')
 	          FROM tasks WHERE project_id = ?`
 	args := []any{projectID}
 	if role != "" {
@@ -401,7 +433,7 @@ func (s *SQLiteStore) ListTasks(projectID, role, status string, limit, offset in
 	for rows.Next() {
 		var m StatusMetadata
 		var createdAt, updatedAt string
-		if err := rows.Scan(&m.ProjectID, &m.TaskID, &m.Role, &m.Title, &m.Status, &createdAt, &updatedAt, &m.ResultViewCount); err != nil {
+		if err := rows.Scan(&m.ProjectID, &m.TaskID, &m.Role, &m.Title, &m.Status, &createdAt, &updatedAt, &m.ResultViewCount, &m.WorkerProjectID); err != nil {
 			return nil, fmt.Errorf("failed to scan task row: %w", err)
 		}
 		m.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
@@ -412,6 +444,81 @@ func (s *SQLiteStore) ListTasks(projectID, role, status string, limit, offset in
 		tasks = []StatusMetadata{}
 	}
 	return tasks, rows.Err()
+}
+
+// ListAccessibleTasks returns tasks owned by the caller plus global tasks that
+// were durably assigned to that worker project. Active assigned tasks sort first
+// so they cannot be hidden behind a busy owner's 20-item default window.
+func (s *SQLiteStore) ListAccessibleTasks(projectID, role, status string, limit, offset int) ([]StatusMetadata, error) {
+	query := `SELECT project_id, task_id, role, title, status, created_at, updated_at,
+	                 result_view_count, COALESCE(worker_project_id, '')
+	          FROM tasks
+	          WHERE (project_id = ? OR worker_project_id = ?)`
+	args := []any{projectID, projectID}
+	if role != "" {
+		query += " AND role = ?"
+		args = append(args, role)
+	}
+	if status != "" {
+		query += " AND status = ?"
+		args = append(args, status)
+	}
+	query += ` ORDER BY
+		CASE WHEN worker_project_id = ? AND project_id <> ? AND status = 'picked' THEN 0 ELSE 1 END,
+		created_at DESC, rowid DESC`
+	args = append(args, projectID, projectID)
+
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	} else if offset > 0 {
+		query += " LIMIT -1"
+	}
+	if offset > 0 {
+		query += " OFFSET ?"
+		args = append(args, offset)
+	}
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list accessible tasks: %w", err)
+	}
+	defer rows.Close()
+
+	tasks := make([]StatusMetadata, 0)
+	for rows.Next() {
+		var m StatusMetadata
+		var createdAt, updatedAt string
+		if err := rows.Scan(&m.ProjectID, &m.TaskID, &m.Role, &m.Title, &m.Status, &createdAt, &updatedAt, &m.ResultViewCount, &m.WorkerProjectID); err != nil {
+			return nil, fmt.Errorf("failed to scan accessible task row: %w", err)
+		}
+		m.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		m.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+		tasks = append(tasks, m)
+	}
+	return tasks, rows.Err()
+}
+
+// ResolveTaskOwner resolves either an owned task or a global task assigned to
+// this worker project. Own tasks win in the astronomically unlikely event that
+// the same random task ID exists in more than one project.
+func (s *SQLiteStore) ResolveTaskOwner(projectID, taskID string) (string, bool, error) {
+	var owner string
+	err := s.db.QueryRow(
+		`SELECT project_id
+		 FROM tasks
+		 WHERE task_id = ? AND (project_id = ? OR worker_project_id = ?)
+		 ORDER BY CASE WHEN project_id = ? THEN 0 ELSE 1 END
+		 LIMIT 1`,
+		taskID, projectID, projectID, projectID,
+	).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("failed to resolve task assignment: %w", err)
+	}
+	return owner, true, nil
 }
 
 func (s *SQLiteStore) CountTasks(projectID, role, status string) (int, error) {
@@ -435,7 +542,8 @@ func (s *SQLiteStore) CountTasks(projectID, role, status string) (int, error) {
 
 func (s *SQLiteStore) LoadActiveTasks() ([]TaskRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT project_id, task_id, role, title, task_md, status
+		`SELECT project_id, task_id, role, title, task_md, status,
+		        COALESCE(worker_project_id, '')
 		 FROM tasks WHERE status IN ('queued', 'picked') ORDER BY created_at ASC`,
 	)
 	if err != nil {
@@ -446,7 +554,7 @@ func (s *SQLiteStore) LoadActiveTasks() ([]TaskRecord, error) {
 	var records []TaskRecord
 	for rows.Next() {
 		var r TaskRecord
-		if err := rows.Scan(&r.ProjectID, &r.TaskID, &r.Role, &r.Title, &r.TaskMD, &r.Status); err != nil {
+		if err := rows.Scan(&r.ProjectID, &r.TaskID, &r.Role, &r.Title, &r.TaskMD, &r.Status, &r.WorkerProjectID); err != nil {
 			return nil, fmt.Errorf("failed to scan active task: %w", err)
 		}
 		records = append(records, r)

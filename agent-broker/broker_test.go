@@ -24,6 +24,13 @@ func (m *mockStore) UpdateStatus(projectID, taskID string, status TaskStatus) er
 	return m.Store.UpdateStatus(projectID, taskID, status)
 }
 
+func (m *mockStore) ClaimTask(projectID, taskID, workerProjectID string) (bool, error) {
+	if m.failStatus == StatusPicked {
+		return false, m.failErr
+	}
+	return m.Store.ClaimTask(projectID, taskID, workerProjectID)
+}
+
 func TestBroker_Lifecycle(t *testing.T) {
 	broker := newTestBroker(t, true, true)
 

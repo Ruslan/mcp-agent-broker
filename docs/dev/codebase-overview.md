@@ -87,8 +87,15 @@ connection to serialize writes.
 | `created_at` | TEXT | RFC3339 UTC |
 | `updated_at` | TEXT | RFC3339 UTC |
 | `result_view_count` | INTEGER | Number of result reads through client paths |
+| `worker_project_id` | TEXT | Nullable durable assignee for a picked global task |
 
-Indexes: `idx_tasks_project_role`, `idx_tasks_project_status`.
+Indexes: `idx_tasks_project_role`, `idx_tasks_project_status`,
+`idx_tasks_worker_status`.
+
+On global pickup, `worker_project_id` records the listener's `X-Project-Id`.
+That project may list, reread, progress, and solve this one task without retaining
+an in-memory token. Requeue clears the assignment before another worker can pick
+the task. Local tasks never receive a cross-project assignment.
 
 ### `task_progress`
 
@@ -135,8 +142,8 @@ remain; otherwise the broker mints a new token. Rotation does not revoke older
 tokens: a previously delivered token remains valid until its own expiry, which
 keeps picked-task restart recovery and admin requeue from acting like an
 implicit worker lease cancellation. Deleting the task revokes all of its work
-tokens. They are capability material accepted by `progress_task` and
-`solve_task`, but omitted from task metadata, admin responses, SSE, and logs.
+tokens. They are capability material accepted by `get_task`, `progress_task`,
+and `solve_task`, but omitted from task metadata, admin responses, SSE, and logs.
 
 ## HTTP surface
 
@@ -174,10 +181,10 @@ open capability and installer paths. See
 | `create_task` | Always | Create and queue a task; returns task `poll_url` when possible |
 | `await_task` | `ENABLE_SYNC` | Block until solve, timeout, or cancellation |
 | `listen_role` | Always | Worker pickup; allowed modes depend on feature flags |
-| `list_tasks` | Always | Return up to 20 recent metadata records |
-| `get_task` | Always | Context-efficient task or result lookup |
-| `solve_task` | Always | Store the final result; accepts global-task `work_token` |
-| `progress_task` | Always | Append progress; accepts global-task `work_token` |
+| `list_tasks` | Always | Return owned tasks plus global tasks assigned to this worker project |
+| `get_task` | Always | Read an owned/assigned task; also accepts `work_token` |
+| `solve_task` | Always | Store the result for an owned/assigned task; accepts `work_token` fallback |
+| `progress_task` | Always | Append progress for an owned/assigned task; accepts `work_token` fallback |
 
 The server also exposes MCP `prompts/list` and `prompts/get`. The synthetic
 `skill-install` prompt returns the same installer body as `/skill/install`.

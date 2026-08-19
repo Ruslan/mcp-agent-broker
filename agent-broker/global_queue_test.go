@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -52,6 +53,11 @@ func TestGlobalQueueCrossProjectCapabilityLifecycle(t *testing.T) {
 	if task["task_id"] != taskID || workToken == "" {
 		t.Fatalf("global delivery missing task capability: %v", task)
 	}
+	readArgs, _ := json.Marshal(map[string]string{"task_id": taskID, "work_token": workToken})
+	readBack, err := handler.handleToolCall(ctx, "capability-only-project", "", "get_task", readArgs)
+	if err != nil || readBack.(map[string]any)["task_md"] != "Do it" {
+		t.Fatalf("work_token did not authorize get_task: response=%v err=%v", readBack, err)
+	}
 
 	aTasks, _ := broker.ListTasks("project-a", "", "", 20, 0)
 	bTasks, _ := broker.ListTasks("project-b", "", "", 20, 0)
@@ -62,8 +68,8 @@ func TestGlobalQueueCrossProjectCapabilityLifecycle(t *testing.T) {
 		t.Fatal("listener project unexpectedly gained task visibility")
 	}
 
-	if _, err := handler.handleToolCall(ctx, "project-b", "", "progress_task", json.RawMessage(`{"task_id":"`+taskID+`","message":"no token"}`)); err == nil {
-		t.Fatal("cross-project progress succeeded without work_token")
+	if _, err := handler.handleToolCall(ctx, "project-c", "", "progress_task", json.RawMessage(`{"task_id":"`+taskID+`","message":"not assigned"}`)); err == nil {
+		t.Fatal("unassigned project unexpectedly progressed global task without work_token")
 	}
 
 	otherID, err := broker.CreateTask("project-c", "g:other:queue", "Other", "Other")
@@ -293,7 +299,7 @@ func TestGlobalQueueResponseWriteFailureRequeuesToOwner(t *testing.T) {
 		t.Fatal("failed response did not return")
 	}
 	meta, err := broker.GetTaskStatus("project-a", taskID)
-	if err != nil || meta.Status != StatusQueued {
+	if err != nil || meta.Status != StatusQueued || meta.WorkerProjectID != "" {
 		t.Fatalf("task was not requeued under owner: meta=%v err=%v", meta, err)
 	}
 	redelivered, _, err := broker.ListenRole(context.Background(), "project-c", "g:shared:worker", "poll", 0)
@@ -357,6 +363,169 @@ func TestExistingDatabaseMigratesWorkTokens(t *testing.T) {
 	var tableName string
 	if err := store.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='work_tokens'`).Scan(&tableName); err != nil || tableName != "work_tokens" {
 		t.Fatalf("work_tokens migration missing: name=%q err=%v", tableName, err)
+	}
+	var workerColumn string
+	if err := store.db.QueryRow(`SELECT name FROM pragma_table_info('tasks') WHERE name='worker_project_id'`).Scan(&workerColumn); err != nil || workerColumn != "worker_project_id" {
+		t.Fatalf("worker assignment migration missing: name=%q err=%v", workerColumn, err)
+	}
+}
+
+func TestGlobalWorkerAssignmentSurvivesRestartAndRestoresAccess(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "broker.db")
+	promptsDir := t.TempDir()
+	store1, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker1, err := NewBroker(store1, promptsDir, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := broker1.CreateTask("project-owner", "g:bench:reviewer", "Recover me", "full durable task body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivered, _, err := broker1.ListenRole(context.Background(), "worker-project-b", "g:bench:reviewer", "poll", 0)
+	if err != nil || delivered == nil || delivered.ID != taskID {
+		t.Fatalf("initial global claim failed: task=%+v err=%v", delivered, err)
+	}
+	meta, err := broker1.GetTaskStatus("project-owner", taskID)
+	if err != nil || meta.WorkerProjectID != "worker-project-b" {
+		t.Fatalf("worker assignment was not persisted: meta=%+v err=%v", meta, err)
+	}
+
+	// Fill the worker's own recent-task window. The active assigned task must
+	// still sort first instead of disappearing behind these rows.
+	for i := 0; i < defaultListTasksLimit+5; i++ {
+		if _, err := broker1.CreateTask("worker-project-b", "local", fmt.Sprintf("local-%02d", i), "local body"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	broker2, err := NewBroker(store2, promptsDir, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &JSONRPCHandler{broker: broker2}
+	ctx := context.Background()
+
+	listed, err := handler.handleToolCall(ctx, "worker-project-b", "", "list_tasks", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks := listed.(map[string]any)["tasks"].([]StatusMetadata)
+	if len(tasks) == 0 || tasks[0].TaskID != taskID || tasks[0].ProjectID != "project-owner" || tasks[0].WorkerProjectID != "worker-project-b" {
+		t.Fatalf("assigned task was not prioritized in worker list: first=%+v", tasks)
+	}
+
+	got, err := handler.handleToolCall(ctx, "worker-project-b", "", "get_task", json.RawMessage(`{"task_id":"`+taskID+`"}`))
+	if err != nil {
+		t.Fatalf("assigned worker could not reread task: %v", err)
+	}
+	if body := got.(map[string]any)["task_md"]; body != "full durable task body" {
+		t.Fatalf("recovered wrong task body: %v", body)
+	}
+	if _, err := handler.handleToolCall(ctx, "other-worker", "", "get_task", json.RawMessage(`{"task_id":"`+taskID+`"}`)); err == nil {
+		t.Fatal("unassigned project unexpectedly read global task")
+	}
+
+	if _, err := handler.handleToolCall(ctx, "worker-project-b", "", "progress_task", json.RawMessage(`{"task_id":"`+taskID+`","message":"recovered"}`)); err != nil {
+		t.Fatalf("assigned worker could not report progress without token: %v", err)
+	}
+	if _, err := handler.handleToolCall(ctx, "worker-project-b", "", "solve_task", json.RawMessage(`{"task_id":"`+taskID+`","result_md":"done after restart"}`)); err != nil {
+		t.Fatalf("assigned worker could not solve without token: %v", err)
+	}
+	status, result, _, err := broker2.AwaitTask(ctx, "project-owner", taskID, 10)
+	if err != nil || status != string(StatusSolved) || result != "done after restart" {
+		t.Fatalf("owner did not receive recovered result: status=%s result=%q err=%v", status, result, err)
+	}
+}
+
+func TestGlobalWorkerAssignmentMovesOnRequeue(t *testing.T) {
+	broker := newTestBroker(t, true, true)
+	handler := &JSONRPCHandler{broker: broker}
+	ctx := context.Background()
+	taskID, err := broker.CreateTask("project-owner", "g:shared:worker", "T", "M")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task, _, err := broker.ListenRole(ctx, "worker-one", "g:shared:worker", "poll", 0); err != nil || task == nil {
+		t.Fatalf("first claim failed: task=%+v err=%v", task, err)
+	}
+	if err := broker.AdminUpdateStatus("project-owner", taskID, string(StatusQueued)); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := broker.GetTaskStatus("project-owner", taskID)
+	if err != nil || meta.WorkerProjectID != "" {
+		t.Fatalf("requeue did not clear assignment: meta=%+v err=%v", meta, err)
+	}
+	if _, err := handler.handleToolCall(ctx, "worker-one", "", "get_task", json.RawMessage(`{"task_id":"`+taskID+`"}`)); err == nil {
+		t.Fatal("old worker retained assignment access after requeue")
+	}
+	if task, _, err := broker.ListenRole(ctx, "worker-two", "g:shared:worker", "poll", 0); err != nil || task == nil {
+		t.Fatalf("second claim failed: task=%+v err=%v", task, err)
+	}
+	meta, err = broker.GetTaskStatus("project-owner", taskID)
+	if err != nil || meta.WorkerProjectID != "worker-two" {
+		t.Fatalf("new assignment was not persisted: meta=%+v err=%v", meta, err)
+	}
+	if _, err := handler.handleToolCall(ctx, "worker-two", "", "solve_task", json.RawMessage(`{"task_id":"`+taskID+`","result_md":"done"}`)); err != nil {
+		t.Fatalf("new assigned worker could not solve: %v", err)
+	}
+}
+
+func TestGlobalBlockingWaitPersistsWorkerAssignment(t *testing.T) {
+	broker := newTestBroker(t, true, true)
+	resultCh := make(chan *Task, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		task, _, err := broker.ListenRole(context.Background(), "worker-project-b", "g:shared:wait", "wait", 2000)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- task
+	}()
+
+	addr := addressFor("worker-project-b", "g:shared:wait")
+	deadline := time.Now().Add(time.Second)
+	for {
+		broker.mu.Lock()
+		_, ready := broker.listeners[addr]
+		broker.mu.Unlock()
+		if ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("listener did not register")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	taskID, err := broker.CreateTask("project-owner", "g:shared:wait", "T", "M")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case task := <-resultCh:
+		if task == nil || task.ID != taskID {
+			t.Fatalf("wrong delivered task: %+v", task)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait delivery timed out")
+	}
+	meta, err := broker.GetTaskStatus("project-owner", taskID)
+	if err != nil || meta.WorkerProjectID != "worker-project-b" {
+		t.Fatalf("blocking wait assignment missing: meta=%+v err=%v", meta, err)
 	}
 }
 

@@ -5,6 +5,11 @@
 - **Area:** Broker routing, task capabilities, MCP clients
 - **Created:** 2026-08-19
 
+> Recovery semantics were extended by
+> [TASK-002](task-002-durable-global-worker-assignment.md): a picked global task
+> is also discoverable by its durably assigned worker project, while its
+> `project_id` and ownership remain unchanged.
+
 ## Use case
 
 Several projects use one broker but retain distinct `X-Project-Id` values. Two
